@@ -11,7 +11,7 @@ export async function api(path,opts={}){
  try {
   r=await fetch(BASE+path,{...opts,headers});
  } catch {
-  throw new Error("Backend is not reachable at http://localhost:5000. Start it with: cd backend && python app.py");
+  throw new Error("Backend is not reachable. Please try again.");
  }
  let data={};
  try { data=await r.json(); } catch { data={}; }
