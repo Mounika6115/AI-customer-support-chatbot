@@ -1,4 +1,4 @@
-const BASE="http://localhost:5000/api";
+const BASE="https://ai-customer-support-chatbot-r89k.vercel.app/api";
 export const token=()=>localStorage.getItem("token");
 export async function api(path,opts={}){
  const headers=new Headers(opts.headers||{});
