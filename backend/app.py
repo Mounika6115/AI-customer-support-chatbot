@@ -22,7 +22,17 @@ load_dotenv(BASE_DIR / ".env")
 
 def resolve_database_url():
     raw_url = os.getenv("DATABASE_URL", "sqlite:///support.db")
+    # Vercel / AWS Lambda serverless functions have a read-only filesystem
+    # except /tmp. A SQLite file bundled in the deployment (e.g.
+    # backend/support.db) can be READ but any write (chat, tickets,
+    # returns, ...) fails with "attempt to write a readonly database" and
+    # every POST returns 500 "An unexpected error occurred." while GETs
+    # keep working. Redirect SQLite to /tmp there (ephemeral but writable;
+    # re-seeded on each cold start). For persistent production data use a
+    # hosted DB (e.g. Neon/Supabase Postgres) via DATABASE_URL.
     if raw_url.startswith("sqlite:///") and not raw_url.startswith("sqlite:////"):
+        if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("LAMBDA_TASK_ROOT"):
+            return "sqlite:////tmp/support.db"
         relative_path = raw_url.replace("sqlite:///", "", 1)
         db_path = (Path(__file__).resolve().parent / relative_path).resolve()
         return f"sqlite:///{db_path}"

@@ -1,4 +1,4 @@
-const BASE="https://ai-customer-support-chatbot-r89k.vercel.app/api";
+const BASE=(import.meta.env.VITE_API_URL || "https://ai-customer-support-chatbot-r89k.vercel.app/api").replace(/\/$/, "");
 export const token=()=>localStorage.getItem("token");
 export async function api(path,opts={}){
  const headers=new Headers(opts.headers||{});
