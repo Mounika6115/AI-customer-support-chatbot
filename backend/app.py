@@ -93,9 +93,13 @@ def create_app():
         seed()
     return app
 
+
+app = create_app()
+
+
 if __name__=="__main__":
     socketio.run(
-        create_app(),
+        app,
         host="0.0.0.0",
         port=5000,
         debug=os.getenv("FLASK_ENV") == "development",
