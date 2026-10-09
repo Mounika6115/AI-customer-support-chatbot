@@ -41,13 +41,13 @@ def chat():
     if conversation_id:
         c = Conversation.query.filter_by(id=conversation_id, customer_id=cid()).first_or_404()
     else:
-        c = Conversation.query.filter_by(customer_id=cid()).order_by(Conversation.updated_at.desc()).first()
-        if c and c.status in ("RESOLVED", "CLOSED"):
-            c = None
-        if c is None:
-            c = Conversation(customer_id=cid())
-            db.session.add(c)
-            db.session.flush()
+        # No id = the UI started a new chat (fresh state / "Start a new chat").
+        # Always open a new conversation so old threads never leak into it.
+        # Continuing a thread requires passing its conversation_id (or using
+        # POST /conversations/<id>/message).
+        c = Conversation(customer_id=cid())
+        db.session.add(c)
+        db.session.flush()
     return handle(c, text, model=model)
 
 
