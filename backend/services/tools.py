@@ -41,10 +41,24 @@ def search_products(query="", brand=None, category=None, max_price=None, min_pri
             except ValueError:
                 pass
     tokens = [t for t in re.split(r"[^a-z0-9₹]+", q) if t and t not in
-              {"show", "me", "phones", "phone", "want", "buy", "under", "with", "please", "the", "a", "an", "need", "looking", "for",
-               "which", "one", "is", "cheapest", "best", "recommend", "compare", "cheap", "cost", "price"}]
+              {"show", "me", "phones", "phone", "want", "buy", "under", "below", "less", "than",
+               "up", "upto", "budget", "within", "around", "about", "max", "with", "please",
+               "the", "a", "an", "need", "looking", "for", "of", "is", "to", "my", "and",
+               "or", "do", "you", "have", "with", "in", "on", "at", "i",
+               "which", "one", "is", "cheapest", "best", "recommend", "compare", "cheap", "cost", "price"}
+              and re.search(r"[a-z]", t)]
+    # A query naming something specific (model number with digits like X99,
+    # or a mid-sentence Capitalized word like Unicorn) that matches nothing
+    # means "not in catalog". A generic browse ("which phone should I pick?")
+    # with an active brand/category/price filter should list matching items.
+    specific = any(any(ch.isdigit() for ch in t) for t in tokens)
+    if not specific:
+        words = re.findall(r"[A-Za-z]+", query or "")
+        specific = any(len(w) > 1 and w[0].isupper() and w.lower() not in {"i"}
+                       for w in words[1:])
     # keep brand-ish tokens
     results = []
+    pool = []
     for p in _product_query().all():
         d = p.to_dict()
         hay = f"{d['product_name']} {d['brand']} {d['category']} {d['description']} {d['specifications']}".lower()
@@ -58,6 +72,7 @@ def search_products(query="", brand=None, category=None, max_price=None, min_pri
             continue
         if in_stock_only and not p.in_stock:
             continue
+        pool.append((p.price or 0, d))
         if q and not tokens:
             score = 1
         elif not q:
@@ -68,15 +83,13 @@ def search_products(query="", brand=None, category=None, max_price=None, min_pri
             if brand and brand in hay:
                 score += 2
             if not score:
-                # Category fallback ONLY for generic queries ("show me phones").
-                # A specific query with unmatched tokens ("Unicorn Phone X99")
-                # must return no match so the bot says "not in catalog"
-                # instead of listing unrelated products.
-                if category and category in hay and not tokens:
-                    score = 1
-                else:
-                    continue
+                continue
         results.append((score, p.price or 0, d))
+    if (not results and tokens and not specific
+            and (brand or category or max_price is not None or min_price is not None)):
+        # Generic browse with filters but only verb-like words matched nothing
+        # ("which phone should I pick?") -> list filter-passing items by price.
+        results = [(1, price, d) for price, d in pool]
     results.sort(key=lambda r: (-r[0], r[1]))
     return [r[2] for r in results[:limit]]
 
