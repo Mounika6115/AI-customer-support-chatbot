@@ -191,7 +191,9 @@ def _extract_category(text):
 
 
 def _extract_price_cap(text):
-    m = re.search(r"under\s*[₹$]?\s*([\d,]+)", text.lower())
+    m = re.search(
+        r"(?:under|below|less\s+than|up\s*to|upto|within|around|about|max|budget(?:\s+(?:of|is))?)"
+        r"\s*[₹$]?\s*([\d,]+)", text.lower())
     if m:
         try:
             return float(m.group(1).replace(",", ""))
@@ -327,6 +329,9 @@ def _is_prompt_injection(text):
                "ignore your instructions", "reveal system prompt",
                "show me the system prompt", "show system prompt",
                "system prompt", "reveal your prompt", "show your prompt",
+               "reveal your instructions", "show your instructions",
+               "repeat your instructions", "what were you told",
+               "what is your system", "bypass", "pretend you are",
                "jailbreak", "dan mode", "override your", "disregard all"]
     return any(s in low for s in signals)
 

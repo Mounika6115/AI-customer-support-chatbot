@@ -30,9 +30,11 @@ def search_products(query="", brand=None, category=None, max_price=None, min_pri
     q = (query or "").strip().lower()
     brand = (brand or "").strip().lower()
     category = (category or "").strip().lower()
-    # price extraction like "under ₹30,000" / "under 30000"
+    # price extraction like "under ₹30,000" / "budget of 20000" / "below 15000"
     if max_price is None and q:
-        m = re.search(r"under\s*[₹$]?\s*([\d,]+)", q)
+        m = re.search(
+            r"(?:under|below|less\s+than|up\s*to|upto|within|around|about|max|budget(?:\s+(?:of|is))?)"
+            r"\s*[₹$]?\s*([\d,]+)", q)
         if m:
             try:
                 max_price = float(m.group(1).replace(",", ""))
