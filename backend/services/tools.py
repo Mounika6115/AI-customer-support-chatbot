@@ -66,8 +66,11 @@ def search_products(query="", brand=None, category=None, max_price=None, min_pri
             if brand and brand in hay:
                 score += 2
             if not score:
-                # allow category-only queries like "smartphones"
-                if category and category in hay:
+                # Category fallback ONLY for generic queries ("show me phones").
+                # A specific query with unmatched tokens ("Unicorn Phone X99")
+                # must return no match so the bot says "not in catalog"
+                # instead of listing unrelated products.
+                if category and category in hay and not tokens:
                     score = 1
                 else:
                     continue
@@ -137,6 +140,15 @@ def get_order_status(order_ref, customer_id=None):
     s = str(order_ref).strip().upper()
     if customer_id:
         o = Order.query.filter_by(order_number=s, customer_id=customer_id).first()
+        if o is None:
+            # Privacy: never fall back to another customer's order. A caller
+            # scoped to a customer only sees that customer's rows.
+            try:
+                oid = int(re.sub(r"\D", "", s) or s)
+                o = Order.query.filter_by(id=oid, customer_id=customer_id).first()
+            except ValueError:
+                pass
+            return None if not o else _order_to_dict(o)
     if o is None:
         o = Order.query.filter_by(order_number=s).first()
     if o is None:
@@ -150,6 +162,10 @@ def get_order_status(order_ref, customer_id=None):
             pass
     if not o:
         return None
+    return _order_to_dict(o)
+
+
+def _order_to_dict(o):
     d = o.to_dict()
     items = [{"product_id": it.product_id,
               "product_name": it.product.display_name if it.product else "",
@@ -322,9 +338,33 @@ def create_service_request(customer_id, issue_type="REPAIR", description="",
                 product_id = items[0].get("product_id")
     if not order_id and not product_id:
         return {"ok": False, "error": "No order or product found to raise a service request against."}
+    issue = (issue_type or "REPAIR").upper()
+    desc = (description or "Customer requested service").strip()[:500]
+    # Idempotency: a retried request (double-click / harness retry) must not
+    # mint duplicate tickets. Reuse the newest open request with the same
+    # customer + issue + target + near-identical description.
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff = _dt.utcnow() - _td(minutes=30)
+        open_statuses = ("REQUESTED", "APPROVED", "PICKUP_SCHEDULED", "PICKED_UP",
+                         "IN_REPAIR", "REPAIRED", "OUT_FOR_DELIVERY")
+        q = ServiceRequest.query.filter(
+            ServiceRequest.customer_id == customer_id,
+            ServiceRequest.issue_type == issue,
+            ServiceRequest.status.in_(open_statuses),
+            ServiceRequest.created_at >= cutoff)
+        if order_id:
+            q = q.filter(ServiceRequest.order_id == order_id)
+        if product_id:
+            q = q.filter(ServiceRequest.product_id == product_id)
+        for existing in q.order_by(ServiceRequest.id.desc()).limit(5).all():
+            if (existing.description or "").strip()[:500] == desc:
+                return {"ok": True, "duplicate": True, **existing.to_dict()}
+    except Exception:
+        pass
     sr = ServiceRequest(customer_id=customer_id, order_id=order_id, product_id=product_id,
-                        issue_type=(issue_type or "REPAIR").upper(),
-                        description=description or "Customer requested service",
+                        issue_type=issue,
+                        description=desc,
                         status="REQUESTED", pickup_status="NOT_SCHEDULED",
                         delivery_status="NOT_SCHEDULED",
                         warranty_claim=bool(warranty_claim))

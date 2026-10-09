@@ -96,5 +96,8 @@ def test_gemini_placeholder_key_returns_clear_configuration_message(monkeypatch)
         result = generate_reply("I want to know about my order status.", user.id)
 
         assert result["escalate"] is False
-        assert "gemini" in result["reply"].lower()
-        assert "api key" in result["reply"].lower()
+        # Customer-facing reply must stay clean (no config warnings); the
+        # misconfiguration is reported in metadata instead.
+        assert "gemini api key" not in result["reply"].lower()
+        assert "mock" in result["model_used"]
+        assert "warning" in result and "gemini" in result["warning"].lower()

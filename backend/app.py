@@ -15,6 +15,7 @@ from models import db
 from routes.auth import auth_bp
 from routes.api import api_bp
 from routes.admin import admin_bp
+from routes.eval import eval_bp
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -41,7 +42,16 @@ def resolve_database_url():
 
 def get_cors_origins():
     raw = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:5174")
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # "*" = allow any evaluator origin (dashboard posts cross-origin).
+    if "*" in origins:
+        return "*"
+    return origins
+
+
+def is_serverless():
+    return bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+                or os.getenv("LAMBDA_TASK_ROOT"))
 
 socketio = SocketIO(cors_allowed_origins=get_cors_origins(), async_mode="threading")
 jwt = JWTManager()
@@ -67,8 +77,18 @@ def create_app():
     app.config["JWT_ACCESS_TOKEN_EXPIRES"]=timedelta(days=7)
     app.config["SQLALCHEMY_DATABASE_URI"]=resolve_database_url()
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"]=False
-    CORS(app, origins=get_cors_origins())
-    db.init_app(app); jwt.init_app(app); socketio.init_app(app)
+    # pool_pre_ping avoids stale pooled connections on hosted Postgres
+    # (Neon/Supabase); harmless for local SQLite.
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"]={"pool_pre_ping": True}
+    origins = get_cors_origins()
+    # browsers reject Access-Control-Allow-Origin:* with credentials, so only
+    # send credentials for an explicit allowlist; eval routes use per-route "*".
+    CORS(app, origins=origins, supports_credentials=(origins != "*"))
+    db.init_app(app); jwt.init_app(app)
+    # Vercel/AWS serverless functions do not support websockets: SocketIO is
+    # local-dev only. REST + polling keep working; _emit() already no-ops.
+    if not is_serverless():
+        socketio.init_app(app)
     @jwt.invalid_token_loader
     def invalid_token_loader(error):
         return jsonify(error="Your session is invalid or expired. Please log in again."), 401
@@ -82,6 +102,7 @@ def create_app():
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
+    app.register_blueprint(eval_bp, url_prefix="/api/eval")
     @app.get("/api/health")
     def health(): return {"status":"ok"}
     @app.errorhandler(NoAuthorizationError)
@@ -98,9 +119,19 @@ def create_app():
         app.logger.exception(e)
         return jsonify(error="An unexpected error occurred."),500
     with app.app_context():
-        db.create_all()
-        from services.seed import seed
-        seed()
+        try:
+            uri = app.config["SQLALCHEMY_DATABASE_URI"]
+            if uri.startswith("sqlite:////tmp/"):
+                os.makedirs("/tmp", exist_ok=True)
+            db.create_all()
+            # SKIP_SEED=1 for Ephemeral serverless cold starts where the caller
+            # manages data externally; default still seeds the demo catalog so
+            # a fresh /tmp SQLite DB is immediately usable for evaluation.
+            if os.getenv("SKIP_SEED", "").strip() != "1":
+                from services.seed import seed
+                seed()
+        except Exception:
+            app.logger.exception("database init/seed failed")
     return app
 
 
@@ -108,10 +139,13 @@ app = create_app()
 
 
 if __name__=="__main__":
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=5000,
-        debug=os.getenv("FLASK_ENV") == "development",
-        allow_unsafe_werkzeug=True,
-    )
+    if is_serverless():
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    else:
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=5000,
+            debug=os.getenv("FLASK_ENV") == "development",
+            allow_unsafe_werkzeug=True,
+        )

@@ -35,24 +35,43 @@ def seed():
 
     cats = {}
     for cn, desc in [("Smartphones", "Mobile phones"), ("Laptops", "Laptops"),
-                     ("Headphones", "Audio"), ("Smart Watches", "Wearables"), ("Tablets", "Tablets")]:
+                     ("Headphones", "Audio"), ("Smart Watches", "Wearables"), ("Tablets", "Tablets"),
+                     ("TVs", "Televisions"), ("Air Conditioners", "Air conditioners")]:
         cats[cn] = _get_or_create_category(cn, desc)
     db.session.flush()
 
     customer = User.query.filter_by(email="customer@example.com").first()
 
     catalogue = [
-        # product_name, brand, category, price, original, stock, rating, warranty
-        ("Nova X1 Smartphone", "Nova", "Smartphones", 699.0, 799.0, 25, 4.5, "1 year"),
-        ("Galaxy M35 5G", "Samsung", "Smartphones", 24999.0, 29999.0, 40, 4.3, "1 year"),
-        ("Galaxy S24 FE", "Samsung", "Smartphones", 29999.0, 59999.0, 15, 4.6, "1 year"),
-        ("Galaxy A15", "Samsung", "Smartphones", 16999.0, 19999.0, 60, 4.2, "1 year"),
-        ("AeroBook 14", "Aero", "Laptops", 1099.0, 1299.0, 12, 4.4, "2 years"),
-        ("Pulse Pro", "Pulse", "Headphones", 149.0, 199.0, 100, 4.1, "1 year"),
-        ("Orbit Watch", "Orbit", "Smart Watches", 249.0, 299.0, 50, 4.0, "1 year"),
-        ("TabOne 11", "TabOne", "Tablets", 499.0, 599.0, 30, 4.2, "1 year"),
+        # product_name, brand, category, price, original, stock, rating, warranty, specs
+        ("Nova X1 Smartphone", "Nova", "Smartphones", 699.0, 799.0, 25, 4.5, "1 year",
+         "6.5-inch display, 128GB storage, 5000mAh battery."),
+        ("Galaxy M35 5G", "Samsung", "Smartphones", 24999.0, 29999.0, 40, 4.3, "1 year",
+         "6.6-inch Super AMOLED, 6000mAh battery, 50MP camera."),
+        ("Galaxy S24 FE", "Samsung", "Smartphones", 29999.0, 59999.0, 15, 4.6, "1 year",
+         "6.7-inch AMOLED, Exynos 2400e, 50MP OIS camera."),
+        ("Galaxy A15", "Samsung", "Smartphones", 16999.0, 19999.0, 60, 4.2, "1 year",
+         "6.5-inch Super AMOLED, 5000mAh battery, 50MP camera."),
+        ("AeroBook 14", "Aero", "Laptops", 1099.0, 1299.0, 12, 4.4, "2 years",
+         "14-inch laptop, 16GB RAM, 512GB SSD."),
+        ("Pulse Pro", "Pulse", "Headphones", 149.0, 199.0, 100, 4.1, "1 year",
+         "Over-ear Bluetooth headphones, 40h battery, noise isolation."),
+        ("Orbit Watch", "Orbit", "Smart Watches", 249.0, 299.0, 50, 4.0, "1 year",
+         "1.85-inch display, heart-rate + SpO2 tracking, 7-day battery."),
+        ("TabOne 11", "TabOne", "Tablets", 499.0, 599.0, 30, 4.2, "1 year",
+         "11-inch 2K display, 8GB RAM, 256GB storage."),
+        ("VisionMax 43 4K TV", "Sony", "TVs", 42999.0, 54999.0, 20, 4.5, "2 years",
+         "43-inch 4K Ultra HD Smart TV, Dolby Vision + Atmos, 3 HDMI, 2 USB, Wi-Fi."),
+        ("NovaView 32 HD TV", "Nova", "TVs", 18999.0, 24999.0, 35, 4.2, "1 year",
+         "32-inch HD Ready Smart TV, 2 HDMI, 1 USB, screen mirroring."),
+        ("FrostCool 1.5T Split AC", "Volt", "Air Conditioners", 35999.0, 45999.0, 18, 4.4, "1 year product, 5 years compressor",
+         "1.5 Ton 5-star split AC, inverter compressor, copper condenser, anti-dust filter."),
+        ("ChillPro 1T Window AC", "Volt", "Air Conditioners", 28499.0, 33999.0, 22, 4.1, "1 year product, 5 years compressor",
+         "1 Ton 3-star window AC, copper condenser, auto-restart, sleep mode."),
     ]
-    for (pname, brand, cat, price, orig, stock, rating, warr) in catalogue:
+    for row in catalogue:
+        (pname, brand, cat, price, orig, stock, rating, warr) = row[:8]
+        specs = row[8] if len(row) > 8 else "Demo specifications. See store page for full specs."
         p = Product.query.filter_by(product_name=pname).first() or \
             Product.query.filter_by(name=pname).first()
         if not p:
@@ -71,7 +90,7 @@ def seed():
         p.rating = rating
         p.warranty_period = warr
         p.warranty = warr
-        p.specifications = "Demo specifications. See store page for full specs."
+        p.specifications = specs
         p.return_policy = "30-day return"
         p.availability = stock > 0
         p.image_url = ""
