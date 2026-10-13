@@ -28,7 +28,7 @@ function Login({ setUser }) {
         <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" />
         <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
         <button>Sign in</button>
-        <small>Demo: customer@example.com / Demo123! · admin@example.com / Demo123!</small>
+        <small>Demo: customer@example.com / Demo123! · admin@example.com / Demo123! · agent@example.com / Demo123!</small>
       </form>
     </div>
   );
@@ -78,6 +78,7 @@ function OrderCard({ order, onClose }) {
 function senderLabel(s) {
   s = (s || "").toLowerCase();
   if (s === "ai") return "🤖 AI Support";
+  if (s === "agent") return "👤 Agent";
   if (s === "system") return "⚙️ System";
   if (s === "customer") return "You";
   return s;
@@ -433,13 +434,17 @@ function Customer() {
   const [model, setModel] = useState(() => localStorage.getItem("ai_model") || "auto");
   const [tickets, setTickets] = useState([]);
   const [services, setServices] = useState([]);
+  const [convos, setConvos] = useState([]);
   const [showTickets, setShowTickets] = useState(false);
+  const [sending, setSending] = useState(false);
+  const genRef = useRef(0);
   const bottomRef = useRef(null);
 
   useEffect(() => {
     api("/models").then(setModels).catch(() => setModels([]));
     api("/tickets").then(setTickets).catch(() => {});
     api("/service-requests").then(setServices).catch(() => {});
+    api("/conversations").then(setConvos).catch(() => {});
   }, []);
 
   function pickModel(m) {
@@ -447,10 +452,11 @@ function Customer() {
     localStorage.setItem("ai_model", m);
   }
 
-  async function refresh(silent = true, id = cid) {
+  async function refresh(silent = true, id = cid, g = genRef.current) {
     if (!id) return;
     try {
       const d = await api(`/conversations/${id}`);
+      if (genRef.current !== g) return; // stale: a new chat started meanwhile
       setStatus(d.status);
       setChat(d.messages.map((m) => ({ sender: m.sender, content: m.content, type: m.message_type, model: m.ai_model })));
     } catch (e) { if (!silent) alert(e.message); }
@@ -459,22 +465,27 @@ function Customer() {
   // polling: updates without full page refresh (Socket.IO-ready backend emits too)
   useEffect(() => {
     if (!cid) return;
-    const t = setInterval(() => refresh(true), 3000);
+    const g = genRef.current;
+    const t = setInterval(() => refresh(true, cid, g), 3000);
     return () => clearInterval(t);
   }, [cid]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chat]);
 
   async function sendText(text) {
-    if (!text.trim()) return;
+    if (!text.trim() || sending) return;
+    const g = genRef.current;
     const isNew = !cid;
+    const targetCid = cid;
     setMsg("");
+    setSending(true);
     setChat((x) => [...x, { sender: "customer", content: text }]);
     try {
       const d = isNew
         ? await api("/chat", { method: "POST", body: JSON.stringify({ message: text, model }) })
-        : await api(`/conversations/${cid}/message`, { method: "POST", body: JSON.stringify({ message: text, model }) });
-      const newCid = d.conversation_id || cid;
+        : await api(`/conversations/${targetCid}/message`, { method: "POST", body: JSON.stringify({ message: text, model }) });
+      if (genRef.current !== g) return; // stale: a new chat started meanwhile
+      const newCid = d.conversation_id || targetCid;
       setCid(newCid);
       setStatus(d.status);
       if (d.products && d.products.length) setLastProducts(d.products);
@@ -485,16 +496,36 @@ function Customer() {
         if (d.reply) setChat((x) => [...x, { sender: "ai", content: d.reply, model: d.model_used }]);
       } else {
         // history from the server already contains the new AI reply — don't append it again
-        await refresh(true, newCid);
+        await refresh(true, newCid, g);
       }
       api("/tickets").then(setTickets).catch(() => {});
     } catch (e) {
+      if (genRef.current !== g) return; // stale: a new chat started meanwhile
       setChat((x) => [...x, { sender: "system", content: e.message }]);
+    } finally {
+      if (genRef.current === g) setSending(false);
     }
   }
   async function send() { await sendText(msg); }
 
   function newChat() {
+    genRef.current += 1;
+    setSending(false);
+    setCid(null);
+    setStatus("AI_ACTIVE");
+    setChat([{ sender: "ai", content: "Hi! Welcome to our customer support. How can I help you?" }]);
+    setLastProducts([]);
+    setLastOrder(null);
+    setLastService(null);
+  }
+
+  async function endChat() {
+    const id = cid;
+    genRef.current += 1;
+    setSending(false);
+    if (id) {
+      try { await api(`/conversations/${id}/close`, { method: "POST" }); } catch {}
+    }
     setCid(null);
     setStatus("AI_ACTIVE");
     setChat([{ sender: "ai", content: "Hi! Welcome to our customer support. How can I help you?" }]);
@@ -527,6 +558,9 @@ function Customer() {
               <span className={"badge " + status}>{status.replaceAll("_", " ")}</span>
             </span>
           </div>
+          {(status === "WAITING_FOR_AGENT" || status === "AGENT_ACTIVE") && (
+            <div className="bubble system"><b>⚙️ System</b><div>An agent has been requested — your messages are saved and an agent will reply here. You can keep writing, or press End chat to close this conversation.</div></div>
+          )}
           <div className="quickbar">
             {QUICK_ACTIONS.map((q) => (
               <button key={q.label} className="chip" onClick={() => sendText(q.msg)}>{q.label}</button>
@@ -553,20 +587,30 @@ function Customer() {
           <div className="composer">
             <input value={msg} onChange={(e) => setMsg(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && send()}
+              disabled={sending}
               placeholder='Try: "Where is my order?", "I want to return my product", "Status of my repair?"' />
-            <button onClick={send}>Send</button>
+            <button onClick={send} disabled={sending}>{sending ? "Sending…" : "Send"}</button>
           </div>
           <div className="composer" style={{ marginTop: 8 }}>
             <button className="secondary" onClick={newChat}>Start a new chat</button>
+            {cid && <button className="secondary" onClick={endChat}>End chat</button>}
           </div>
         </section>
         <aside className="card side">
           <h3>My support</h3>
-          <button className="secondary" onClick={() => { setShowTickets((s) => !s); api("/tickets").then(setTickets).catch(() => {}); api("/service-requests").then(setServices).catch(() => {}); }}>
+          <button className="secondary" onClick={() => { setShowTickets((s) => !s); api("/tickets").then(setTickets).catch(() => {}); api("/service-requests").then(setServices).catch(() => {}); api("/conversations").then(setConvos).catch(() => {}); }}>
             {showTickets ? "Hide requests" : "My requests & tickets"}
           </button>
           {showTickets && (
             <div className="ticketlist">
+              {!!convos.length && <h4>My conversations</h4>}
+              {convos.slice(0, 5).map((cv) => (
+                <div key={cv.id} className="ticket">
+                  <b>Conversation {cv.id}</b>
+                  <small>{(cv.status || "").replaceAll("_", " ")}</small>
+                  <div className="btnrow"><button className="secondary" onClick={() => { setCid(cv.id); refresh(true, cv.id); }}>Open</button></div>
+                </div>
+              ))}
               {!!services.length && <h4>Service requests</h4>}
               {services.map((s) => (
                 <div key={s.request_number || s.id} className="ticket">
@@ -594,6 +638,90 @@ function Customer() {
       {tab === "shop" && <ShopPanel />}
       {tab === "orders" && <OrdersPanel />}
       {tab === "tickets" && <TicketsPanel />}
+    </Shell>
+  );
+}
+
+function Agent() {
+  const [queue, setQueue] = useState([]);
+  const [cid, setCid] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+
+  async function loadQueue() {
+    try { setErr(""); setQueue(await api("/agent/queue")); }
+    catch (e) { setErr(e.message); }
+  }
+  useEffect(() => { loadQueue(); }, []);
+
+  async function open(id) {
+    const d = await api(`/agent/conversations/${id}`);
+    setCid(id);
+    setDetail(d);
+  }
+  async function openQuiet(id) {
+    try { await open(id); } catch {}
+    try { await loadQueue(); } catch {}
+  }
+  useEffect(() => {
+    if (!cid) return;
+    const t = setInterval(() => openQuiet(cid), 3000);
+    return () => clearInterval(t);
+  }, [cid]);
+
+  async function claim(id) {
+    try { setErr(""); await api(`/agent/conversations/${id}/claim`, { method: "POST" }); await open(id); await loadQueue(); }
+    catch (e) { setErr(e.message); }
+  }
+  async function send() {
+    if (!msg.trim() || !cid) return;
+    const text = msg;
+    setMsg("");
+    try { await api(`/agent/conversations/${cid}/reply`, { method: "POST", body: JSON.stringify({ message: text }) }); await open(cid); }
+    catch (e) { setMsg(text); setErr(e.message); }
+  }
+
+  return (
+    <Shell title="Agent Inbox">
+      <div className="grid">
+        <section className="card">
+          <h3>Waiting for agent ({queue.length})</h3>
+          <button className="secondary" onClick={loadQueue}>Refresh</button>
+          {err && <div className="bubble system"><b>⚙️ System</b><div>{err}</div></div>}
+          {!queue.length && <div className="empty">No conversations waiting.</div>}
+          {queue.map((q) => (
+            <div key={q.id} className="ticket">
+              <b>Conversation {q.id}</b>
+              <small>{q.intent} · {q.priority} · {q.status}</small>
+              <div className="btnrow">
+                <button className="secondary" onClick={() => open(q.id)}>View</button>
+                <button onClick={() => claim(q.id)}>Claim & reply</button>
+              </div>
+            </div>
+          ))}
+        </section>
+        <section className="card chat">
+          <div className="chathead"><b>{cid ? `Conversation ${cid}` : "Select a conversation"}</b></div>
+          <div className="messages">
+            {(detail?.messages || []).map((m, i) => (
+              <div key={i} className={"bubble " + m.sender}>
+                <b>{senderLabel(m.sender)}</b>
+                <div>{m.content}</div>
+              </div>
+            ))}
+            {cid && !(detail?.messages || []).length && <div className="empty">No messages yet.</div>}
+          </div>
+          {cid && (
+            <div className="composer">
+              <input value={msg} onChange={(e) => setMsg(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && send()}
+                placeholder="Reply as agent…" />
+              <button onClick={send}>Send</button>
+            </div>
+          )}
+        </section>
+      </div>
     </Shell>
   );
 }
@@ -639,13 +767,15 @@ function App() {
     catch { return null; }
   });
   if (!user) return <Login setUser={setUser} />;
-  // Old agent logins are no longer valid in pure-AI mode — force fresh login.
-  if (user.role !== "admin" && user.role !== "customer") {
+  // Agent logins route to the agent inbox (AIRM-41); unknown roles re-login.
+  if (user.role !== "admin" && user.role !== "customer" && user.role !== "agent") {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
     return <Login setUser={setUser} />;
   }
-  return user.role === "admin" ? <Admin /> : <Customer />;
+  if (user.role === "admin") return <Admin />;
+  if (user.role === "agent") return <Agent />;
+  return <Customer />;
 }
 
 createRoot(document.getElementById("root")).render(<App />);

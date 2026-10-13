@@ -12,6 +12,13 @@ def cid():
     return int(get_jwt_identity())
 
 
+# Waiting-room notice shown (and stored) while a handoff is pending. Kept in
+# one place so the API reply, the persisted SYSTEM message, and the dedup
+# check always use identical text.
+WAITING_NOTICE = ("Thanks — our support team has your messages and an agent "
+                  "will reply here shortly.")
+
+
 def _socket():
     try:
         from app import socketio
@@ -78,6 +85,27 @@ def _save_msg(conversation_id, sender_id, sender_type, content, ai_model=None, m
 def handle(c, text, model="auto"):
     if not text:
         return {"error": "Message cannot be empty"}, 400
+    if c.status == "CLOSED":
+        # Ended conversations stay ended (AIRM-46): never silently reopen.
+        return {"error": "This conversation is closed. Start a new chat to continue."}, 400
+    if c.status in ("WAITING_FOR_AGENT", "AGENT_ACTIVE"):
+        # Handoff in progress (AIRM-41 Phase 1): the AI stays silent. The
+        # customer message is stored so the agent can read and reply to it.
+        # The waiting notice is persisted (deduped) so polling/refresh keeps
+        # it visible instead of wiping it.
+        mine = _save_msg(c.id, cid(), "CUSTOMER", text, message_type="TEXT")
+        db.session.flush()
+        prev = (Message.query.filter(Message.conversation_id == c.id,
+                                     Message.id != mine.id)
+                .order_by(Message.created_at.desc(), Message.id.desc()).first())
+        if prev is None or prev.sender_type != "SYSTEM" or prev.text != WAITING_NOTICE:
+            _save_msg(c.id, None, "SYSTEM", WAITING_NOTICE, message_type="SYSTEM")
+        db.session.commit()
+        _emit(c.id)
+        return {"conversation_id": c.id, "status": c.status, "escalate": True,
+                "reply": WAITING_NOTICE,
+                "model_used": "handoff", "products": [], "order": None,
+                "action": None}
     _save_msg(c.id, cid(), "CUSTOMER", text, message_type="TEXT")
     history = Message.query.filter_by(conversation_id=c.id).order_by(Message.created_at.asc()).all()
     history_data = [{"role": "customer" if m.sender_type == "CUSTOMER" else "ai",
@@ -86,11 +114,11 @@ def handle(c, text, model="auto"):
     c.intent = out["intent"]
     c.sentiment = out["sentiment"]
     c.priority = out["priority"]
-    c.status = "AI_ACTIVE"
+    c.status = "WAITING_FOR_AGENT" if out.get("escalate") else "AI_ACTIVE"
     products = out.get("products") or []
     order = out.get("order")
     # Pure-AI mode: no tickets, no agent assignment. Always answer directly.
-    out["escalate"] = False
+    out["escalate"] = out.get("escalate", False)
     msg_type = "PRODUCT" if products else ("ORDER" if order else "TEXT")
     _save_msg(c.id, None, "AI", out["reply"],
               ai_model=out.get("model_used") or "mock",
@@ -115,6 +143,20 @@ def conversation(i):
     ms = Message.query.filter_by(conversation_id=i).order_by(Message.created_at, Message.id).all()
     return {"id": c.id, "status": c.status,
             "messages": [m.to_dict() for m in ms]}
+
+
+@api_bp.post("/conversations/<int:i>/close")
+@jwt_required()
+def close_conversation(i):
+    """End a conversation (AIRM-46). Owner-only, idempotent: repeated closes
+    return the CLOSED conversation. Other customers get 404."""
+    from datetime import datetime as _dt
+    c = Conversation.query.filter_by(id=i, customer_id=cid()).first_or_404()
+    if c.status != "CLOSED":
+        c.status = "CLOSED"
+        c.closed_at = _dt.utcnow()
+        db.session.commit()
+    return {"conversation_id": c.id, "status": c.status}
 
 
 @api_bp.get("/tickets")
@@ -396,7 +438,7 @@ def warranty():
     if pid:
         p = T.get_product(pid)
         if p:
-            return {"product_id": pid, "period": p.get("warranty_period") or p.get("warranty") or "1 year",
+            return {"product_id": pid, "period": p.get("warranty_period") or p.get("warranty") or T.WARRANTY_DEFAULT_PERIOD,
                     "status": "ACTIVE", "source": "product record"}
     return []
 

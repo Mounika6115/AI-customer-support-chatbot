@@ -16,6 +16,7 @@ def seed():
     for name, email, role in [
         ("Demo Customer", "customer@example.com", "customer"),
         ("Admin", "admin@example.com", "admin"),
+        ("Demo Agent", "agent@example.com", "agent"),
     ]:
         user = User.query.filter_by(email=email).first()
         if user is None:
@@ -96,6 +97,11 @@ def seed():
         p.image_url = ""
     db.session.flush()
 
+    # Rolling demo dates: the two demo orders are always dated relative to
+    # today so they stay inside the 30-day return window no matter when the
+    # app is (re)started. Only the date strings move; statuses, amounts,
+    # products, tracking, and payments are never touched here.
+    _today = datetime.utcnow().date()
     if customer and not Order.query.filter_by(customer_id=customer.id).first():
         nova = Product.query.filter_by(product_name="Nova X1 Smartphone").first()
         pulse = Product.query.filter_by(product_name="Pulse Pro").first()
@@ -103,10 +109,10 @@ def seed():
                   payment_status="PAID", order_status="SHIPPED",
                   delivery_status="OUT_FOR_DELIVERY",
                   delivery_address="Bengaluru, Karnataka",
-                  expected_delivery_date="2026-10-07",
+                  expected_delivery_date=(_today + timedelta(days=3)).isoformat(),
                   tracking_number="TRK100234",
                   product="Nova X1 Smartphone", quantity=1, price=699.0,
-                  order_date="2026-09-25")
+                  order_date=(_today - timedelta(days=7)).isoformat())
         db.session.add(o)
         db.session.flush()
         if nova:
@@ -124,10 +130,10 @@ def seed():
                        payment_status="PAID", order_status="DELIVERED",
                        delivery_status="DELIVERED",
                        delivery_address="Bengaluru, Karnataka",
-                       expected_delivery_date="2026-09-20",
+                       expected_delivery_date=(_today - timedelta(days=20)).isoformat(),
                        tracking_number="TRK100235",
                        product="Pulse Pro", quantity=1, price=149.0,
-                       order_date="2026-09-12")
+                       order_date=(_today - timedelta(days=25)).isoformat())
             db.session.add(o2)
             db.session.flush()
             db.session.add(OrderItem(order_id=o2.id, product_id=pulse.id, quantity=1, price=149.0))
@@ -136,6 +142,17 @@ def seed():
             db.session.add(Warranty(product_id=pulse.id, order_id=o2.id, customer_id=customer.id,
                                     period="1 year", status="ACTIVE", expires_at="2027-09-12"))
     db.session.flush()
+    if customer:
+        # Refresh the demo order dates on every start so the seeded flows
+        # (return eligibility, tracking) behave the same at any wall-clock
+        # date. Scoped to the two demo order numbers; user data untouched.
+        for number, ordered_ago, eta_offset in (("RD100234", 7, 3), ("RD100235", 25, -20)):
+            oo = Order.query.filter_by(order_number=number, customer_id=customer.id).first()
+            if oo is None:
+                continue
+            oo.order_date = (_today - timedelta(days=ordered_ago)).isoformat()
+            oo.expected_delivery_date = (_today + timedelta(days=eta_offset)).isoformat()
+        db.session.flush()
 
     if not Offer.query.first():
         db.session.add(Offer(title="Festive Sale - 10% off Smartphones",
@@ -157,11 +174,11 @@ def seed():
             db.session.add(KnowledgeBase(title=title, category=cat, content=content))
 
     # One-time cleanup of pre-removal human-agent state so old DBs just work.
+    # NOTE (AIRM-41 Phase 1): conversation WAITING_FOR_AGENT / AGENT_ACTIVE
+    # statuses are live again and must NOT be migrated; only legacy ticket
+    # states are normalized below.
     try:
-        from models import Conversation, Ticket
-        for c in Conversation.query.filter(
-                Conversation.status.in_(["WAITING_FOR_AGENT", "AGENT_ACTIVE", "WAITING_FOR_CUSTOMER"])).all():
-            c.status = "AI_ACTIVE"
+        from models import Ticket
         for t in Ticket.query.filter_by(status="WAITING_FOR_AGENT").all():
             t.status = "OPEN"
         db.session.commit()

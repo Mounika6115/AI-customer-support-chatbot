@@ -14,10 +14,14 @@ from werkzeug.exceptions import HTTPException
 from models import db
 from routes.auth import auth_bp
 from routes.api import api_bp
+from routes.agent import agent_bp
 from routes.admin import admin_bp
 from routes.eval import eval_bp
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+# AIRM-12: honor backend/.env first (backend-specific wins over root .env;
+# real OS/Vercel env still wins over both). Missing files are a no-op.
+load_dotenv(BASE_DIR / "backend" / ".env")
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -52,6 +56,31 @@ def get_cors_origins():
 def is_serverless():
     return bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
                 or os.getenv("LAMBDA_TASK_ROOT"))
+
+
+def get_server_host():
+    """Loopback by default; LAN exposure requires explicit ``HOST=0.0.0.0``."""
+    return (os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1")
+
+
+def is_debug_enabled():
+    """Single gate for Werkzeug debug mode (debugger + reloader).
+
+    Debug is ON only for explicit local development. It is OFF whenever any
+    production signal is present — regardless of a stale ``FLASK_ENV`` value:
+    serverless deployments, ``ENV=production``/``FLASK_ENV=production``, or
+    ``FLASK_DEBUG=0``.
+    """
+    if is_serverless():
+        return False
+    if os.getenv("ENV", "").strip().lower() in ("production", "prod"):
+        return False
+    if os.getenv("FLASK_ENV", "").strip().lower() == "production":
+        return False
+    if os.getenv("FLASK_DEBUG", "").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return (os.getenv("FLASK_ENV", "").strip().lower() == "development"
+            or os.getenv("FLASK_DEBUG", "").strip() == "1")
 
 socketio = SocketIO(cors_allowed_origins=get_cors_origins(), async_mode="threading")
 jwt = JWTManager()
@@ -101,6 +130,7 @@ def create_app():
     Limiter(get_remote_address, app=app, default_limits=["120 per minute"])
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(api_bp, url_prefix="/api")
+    app.register_blueprint(agent_bp, url_prefix="/api/agent")
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(eval_bp, url_prefix="/api/eval")
     @app.get("/api/health")
@@ -139,13 +169,18 @@ app = create_app()
 
 
 if __name__=="__main__":
+    # Local `python app.py` only. Vercel imports `app` via api/index.py and
+    # never executes this block. Defaults bind loopback with debug off;
+    # LAN exposure needs an explicit HOST override. The Werkzeug
+    # non-TTY bypass below is enabled for local development only, so the
+    # production guard stays active everywhere else.
     if is_serverless():
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+        app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=False)
     else:
         socketio.run(
             app,
-            host="0.0.0.0",
-            port=5000,
-            debug=os.getenv("FLASK_ENV") == "development",
-            allow_unsafe_werkzeug=True,
+            host=get_server_host(),
+            port=int(os.getenv("PORT", "5000")),
+            debug=is_debug_enabled(),
+            allow_unsafe_werkzeug=is_debug_enabled(),
         )

@@ -97,15 +97,20 @@ def _extract_history(payload):
     return out[-12:]
 
 
-def _get_or_create_conversation(customer_id, conversation_id=None, session_id=None):
+def _get_or_create_conversation(customer_id, conversation_id=None, session_id=None,
+                                fresh=False):
     c = None
-    if conversation_id:
+    if fresh:
+        # Callers (e.g. the Chatbot-Compare harness) that need an isolated
+        # thread skip every reuse branch below.
+        pass
+    elif conversation_id:
         try:
             c = Conversation.query.filter_by(
                 id=int(conversation_id), customer_id=customer_id).first()
         except (TypeError, ValueError):
             c = None
-    if c is None and session_id:
+    if c is None and session_id and not fresh:
         # stable per-eval-session conversation so multi-turn cases keep memory
         try:
             sid = int(str(session_id).replace("eval-", ""))
@@ -113,7 +118,7 @@ def _get_or_create_conversation(customer_id, conversation_id=None, session_id=No
                 id=sid, customer_id=customer_id).first()
         except (TypeError, ValueError):
             c = None
-    if c is None:
+    if c is None and not fresh:
         c = Conversation.query.filter_by(customer_id=customer_id).order_by(
             Conversation.updated_at.desc()).first()
         if c and c.status in ("RESOLVED", "CLOSED"):
@@ -141,25 +146,22 @@ def chat():
     if not text:
         return jsonify(error="Message cannot be empty"), 400
     model = str(payload.get("model") or "auto").strip().lower() or "auto"
-    # Avoid the "Gemini API key is not configured" prefix in eval replies:
-    # evaluators judge answer quality, so use clean mock grounding unless
-    # the caller explicitly requested a live provider that is configured.
-    if model == "auto":
-        try:
-            from services.ai import _is_placeholder_api_key
-            import os as _os
-            if (_os.getenv("AI_PROVIDER", "mock").strip().lower() == "gemini"
-                    and _is_placeholder_api_key(_os.getenv("GEMINI_API_KEY", ""))):
-                model = "mock"
-        except Exception:
-            pass
+    # Quota guard: this endpoint is unauthenticated, so it must never spend
+    # live-provider quota unless the operator explicitly opts in with
+    # EVAL_ALLOW_LIVE=1 (e.g. an intentional live compare run). Mock answers
+    # carry the same DB grounding; only the phrasing differs. Automated tests
+    # always run with the gate closed, so they need no API key.
+    import os as _os
+    if model != "mock" and _os.getenv("EVAL_ALLOW_LIVE", "").strip() != "1":
+        model = "mock"
     history = _extract_history(payload)
     try:
         customer_id = _demo_customer_id()
         c = _get_or_create_conversation(
             customer_id,
-            conversation_id=payload.get("conversation_id"),
-            session_id=payload.get("session_id") or payload.get("sessionId"))
+            conversation_id=None if payload.get("fresh") else payload.get("conversation_id"),
+            session_id=payload.get("session_id") or payload.get("sessionId"),
+            fresh=bool(payload.get("fresh")))
         if c.id is None:
             db.session.flush()
         # Reuse the exact authed handler so eval and app behave identically
@@ -181,10 +183,10 @@ def chat():
         c.intent = out.get("intent")
         c.sentiment = out.get("sentiment")
         c.priority = out.get("priority")
-        c.status = "AI_ACTIVE"
+        c.status = "WAITING_FOR_AGENT" if out.get("escalate") else "AI_ACTIVE"
         products = out.get("products") or []
         order = out.get("order")
-        out["escalate"] = False
+        out["escalate"] = out.get("escalate", False)
         msg_type = "PRODUCT" if products else ("ORDER" if order else "TEXT")
         _save_msg(c.id, None, "AI", out["reply"],
                   ai_model=out.get("model_used") or "mock",
@@ -242,3 +244,38 @@ def chat():
 @cross_origin(origins="*")
 def message_alias():
     return chat()
+
+
+def _result_to_dict(r):
+    return {"id": r.id, "test_id": r.test_id, "category": r.category,
+            "customer_input": r.customer_input, "expected": r.expected,
+            "actual": r.actual, "passed": r.passed, "reason": r.reason,
+            "response_ms": r.response_ms,
+            "created_at": r.created_at.isoformat() if r.created_at else ""}
+
+
+@eval_bp.get("/results")
+@cross_origin(origins="*")
+def results():
+    """Stored Chatbot-Compare outcomes, newest first (AIRM-41 Phase 2)."""
+    from models import EvaluationResult
+    test_id = (request.args.get("test_id") or "").strip()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    q = EvaluationResult.query
+    if test_id:
+        q = q.filter_by(test_id=test_id)
+    rows = q.order_by(EvaluationResult.id.desc()).limit(limit).all()
+    return jsonify([_result_to_dict(r) for r in rows])
+
+
+@eval_bp.get("/results/<test_id>")
+@cross_origin(origins="*")
+def results_for_case(test_id):
+    """Stored outcomes for one compare case, newest first."""
+    from models import EvaluationResult
+    rows = (EvaluationResult.query.filter_by(test_id=(test_id or "").strip())
+            .order_by(EvaluationResult.id.desc()).limit(50).all())
+    return jsonify([_result_to_dict(r) for r in rows])

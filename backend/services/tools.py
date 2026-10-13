@@ -5,11 +5,11 @@ These are the single source of truth used by services/ai.py grounding,
 by the REST API, and (via prompt instructions) by Gemini function calling.
 """
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from models import (
     db, User, Product, ProductCategory, Order, OrderItem,
     Payment, ReturnRequest, Refund, Message,
-    Offer, Warranty, Notification, ServiceRequest,
+    Offer, Warranty, Notification, ServiceRequest, KnowledgeBase,
 )
 
 # ------------------------------------------------------------ customers
@@ -19,6 +19,52 @@ def get_customer(customer_id):
         return None
     return {"id": u.id, "name": u.name, "email": u.email, "phone": u.phone or "",
             "role": u.role, "created_at": u.created_at.isoformat() if u.created_at else ""}
+
+# ------------------------------------------------------------ policies
+# Canonical store defaults. The "1 year" warranty default mirrors the seeded
+# KnowledgeBase "Warranty Policy" ("usually 1 year") and the Warranty.period
+# column default — it is a documented store default, never invented per reply.
+WARRANTY_DEFAULT_PERIOD = "1 year"
+
+# Seeded KnowledgeBase policy window, in days ("within 30 days of delivery").
+RETURN_WINDOW_DAYS = 30
+
+
+def _as_date(value):
+    """Best-effort date parsing (datetime, date, ISO strings). None when unknown."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s).date()
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def get_policy_text(category):
+    """Return the seeded KnowledgeBase policy content for a category, or None.
+
+    Chat replies source their policy wording from here and keep a short
+    hardcoded fallback only when no policy row exists.
+    """
+    cat = (category or "").strip().lower()
+    if not cat:
+        return None
+    row = KnowledgeBase.query.filter_by(category=cat).first()
+    if row is None:
+        row = KnowledgeBase.query.filter(KnowledgeBase.title.ilike(f"%{cat}%")).first()
+    content = (row.content or "").strip() if row else ""
+    return content or None
 
 # ------------------------------------------------------------ products
 def _product_query():
@@ -128,7 +174,7 @@ def get_warranty(product_id=None, order_id=None, customer_id=None):
     if not rows and product_id:
         p = Product.query.get(product_id)
         if p:
-            return {"product_id": product_id, "period": p.warranty_period or p.warranty or "1 year",
+            return {"product_id": product_id, "period": p.warranty_period or p.warranty or WARRANTY_DEFAULT_PERIOD,
                     "status": "ACTIVE", "source": "product record"}
         return None
     return [{"id": w.id, "product_id": w.product_id, "period": w.period,
@@ -227,6 +273,10 @@ def create_return(order_ref, customer_id, reason="", product_id=None):
     s = str(order_ref).strip().upper()
     o = Order.query.filter_by(order_number=s, customer_id=customer_id).first()
     if o is None:
+        if s:
+            # Explicit ref that isn't on this account: never fall back to a
+            # different order for a write action.
+            return {"ok": False, "error": f"Order {str(order_ref).strip()} not found for this customer."}
         # fall back to most recent order if no ref given
         o = Order.query.filter_by(customer_id=customer_id).order_by(Order.id.desc()).first()
     if not o:
@@ -246,8 +296,11 @@ def get_return_status(return_id=None, order_ref=None, customer_id=None):
         q = q.filter_by(customer_id=customer_id)
     if order_ref:
         o = get_order_status(order_ref, customer_id)
-        if o:
-            q = q.filter_by(order_id=o["id"])
+        if not o:
+            # Explicit ref that isn't on this account: report nothing rather
+            # than another order's returns.
+            return []
+        q = q.filter_by(order_id=o["id"])
     rows = q.order_by(ReturnRequest.id.desc()).all()
     return [{"id": r.id, "order_id": r.order_id, "status": r.status,
              "reason": r.reason} for r in rows]
@@ -260,17 +313,31 @@ def get_refund_status(refund_id=None, order_ref=None, customer_id=None):
         q = q.filter_by(customer_id=customer_id)
     if order_ref:
         o = get_order_status(order_ref, customer_id)
-        if o:
-            q = q.filter_by(order_id=o["id"])
+        if not o:
+            # Explicit ref that isn't on this account: report nothing rather
+            # than another order's refunds.
+            return []
+        q = q.filter_by(order_id=o["id"])
     rows = q.order_by(Refund.id.desc()).all()
     return [{"id": r.id, "order_id": r.order_id, "amount": r.amount,
              "status": r.status} for r in rows]
 
 
 def get_return_eligibility(order_ref, customer_id):
-    """Check whether an order can still be returned (30-day window, not already returned/cancelled)."""
+    """Check whether an order can still be returned.
+
+    Rules (all verified against DB rows): the order must exist on this
+    account, must not be in a terminal state, must have no open return, and
+    must be within RETURN_WINDOW_DAYS of its delivery/order date. An explicit
+    ref that isn't on this account never falls back to another order.
+    """
     o = get_order_status(order_ref, customer_id)
     if not o:
+        if str(order_ref or "").strip():
+            ref = str(order_ref).strip()
+            return {"ok": False, "eligible": False, "order_number": ref,
+                    "reason": f"Order {ref} was not found on your account. "
+                              f"Please check the order number and try again."}
         # fall back to latest order so "I want to return my product" still works
         orders = get_orders(customer_id, limit=1)
         if not orders:
@@ -287,9 +354,24 @@ def get_return_eligibility(order_ref, customer_id):
         return {"ok": True, "eligible": False, "order_number": o["order_number"],
                 "order_status": o.get("order_status"),
                 "reason": f"A return (#{existing.id}, status {existing.status}) already exists for order {o['order_number']}."}
+    row = Order.query.get(o["id"])
+    base = None
+    if row is not None:
+        base = (_as_date(row.expected_delivery_date) or _as_date(row.order_date)
+                or _as_date(row.created_at))
+    if base is not None:
+        age_days = (date.today() - base).days
+        if age_days > RETURN_WINDOW_DAYS:
+            return {"ok": True, "eligible": False, "order_number": o["order_number"],
+                    "order_status": o.get("order_status"),
+                    "reason": f"Order {o['order_number']} is {age_days} days old "
+                              f"({base.isoformat()}), outside the {RETURN_WINDOW_DAYS}-day return window.",
+                    "order_id": o["id"]}
+    policy = get_policy_text("returns")
+    window_note = policy or "Returns are accepted within the 30-day return window."
     return {"ok": True, "eligible": True, "order_number": o["order_number"],
             "order_status": o.get("order_status"),
-            "reason": f"Order {o['order_number']} is eligible for return within the 30-day return window.",
+            "reason": f"Order {o['order_number']} is eligible for return. {window_note}",
             "order_id": o["id"]}
 
 

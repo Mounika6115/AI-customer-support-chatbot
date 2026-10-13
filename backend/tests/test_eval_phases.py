@@ -81,7 +81,10 @@ def test_tv_price_uses_catalog():
     app = _fresh_app()
     r = app.test_client().post("/api/eval/chat", json={"message": "What is the price of a TV?"})
     reply = r.get_json()["reply"]
-    assert "18999" in reply or "42999" in reply
+    # Live Gemini may comma-format prices ("18,999.0"); normalize before
+    # checking for a real catalog price. Grounding still required.
+    compact = reply.replace(",", "")
+    assert "18999" in compact or "42999" in compact
 
 
 def test_ac_warranty_uses_catalog_not_order():
@@ -97,7 +100,14 @@ def test_unknown_product_says_not_available():
     r = app.test_client().post("/api/eval/chat",
                                json={"message": "Do you have Unicorn Phone X99?"})
     reply = r.get_json()["reply"].lower()
-    assert "not available in our catalog" in reply
+    # Accept any clear unavailability statement (mock and live-Gemini
+    # phrasings differ). Grounding guard below stays strict: no invented
+    # listings of real catalog items.
+    assert ("not available" in reply or "unavailable" in reply
+            or "do not have" in reply or "don't have" in reply
+            or "couldn't find" in reply or "no matching product" in reply
+            or "do not carry" in reply or "don't carry" in reply
+            or "not carried" in reply or "not in our catalog" in reply)
     assert "nova x1" not in reply and "galaxy" not in reply
 
 
@@ -221,6 +231,226 @@ def test_service_ticket_no_duplicate_on_retry():
     assert b["action"].get("duplicate") is True
 
 
+# ---------------- AIRM-29: unknown orders + broken products ----------------
+
+def test_unknown_order_ref_is_not_substituted():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        for msg in ("Where is my order #99999?", "Track order RD999999"):
+            out = generate_reply(msg, cid, model="mock")
+            assert out["order"] is None
+            assert out["action"] and out["action"].get("ok") is False
+            assert "RD100234" not in out["reply"] and "RD100235" not in out["reply"]
+            assert "99999" in out["reply"]
+
+
+def test_unknown_order_cancel_does_not_touch_latest():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        before = {o["order_number"]: o["order_status"] for o in T.get_orders(cid)}
+        out = generate_reply("Please cancel order RD999999", cid, model="mock")
+        after = {o["order_number"]: o["order_status"] for o in T.get_orders(cid)}
+        assert before == after
+        assert out["action"] and out["action"].get("ok") is False
+        assert "RD999999" in out["reply"]
+        assert "RD100234" not in out["reply"] and "RD100235" not in out["reply"]
+
+
+def test_unknown_return_ref_does_not_use_latest():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("I want to return order RD999999", cid, model="mock")
+        assert T.get_return_status(customer_id=cid) == []
+        assert out["action"] and out["action"].get("ok") is False
+        assert "RD999999" in out["reply"]
+
+
+def test_broken_product_creates_damaged_request():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("My TV screen is cracked and not working, what should I do?",
+                             cid, model="mock")
+        assert out["action"] and out["action"].get("ok") is True
+        assert out["action"].get("type") == "service_request"
+        assert out["service"] and out["service"]["request_number"].startswith("SRV")
+        assert "SRV" in out["reply"]
+
+
+def test_valid_repair_creates_service_request():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("My AC is not cooling, please arrange a repair",
+                             cid, model="mock")
+        assert out["action"] and out["action"].get("ok") is True
+        assert out["action"].get("type") == "service_request"
+        assert out["action"].get("status") == "REQUESTED"
+        assert "SRV" in out["reply"]
+
+
+def test_phone_number_not_treated_as_order_ref():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("My number is 9000000001, where is my previous order?",
+                             cid, model="mock")
+        assert out["order"] is not None
+        assert "RD100" in out["reply"]
+
+
+def test_reorder_wording_not_treated_as_order_ref():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("I reordered box 500 last week, can you help?", cid, model="mock")
+        assert (out.get("action") or {}).get("type") != "unknown_order"
+        assert "couldn't find order" not in out["reply"]
+
+
+# ---------------- AIRM-30: verified facts only ----------------
+
+def test_prices_come_from_catalog():
+    import re
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("Show me Samsung phones under 30000", cid, model="mock")
+        catalog_prices = {float(p["price"]) for p in T.search_products(query="", limit=100)}
+        mentioned = {float(x.replace(",", "")) for x in re.findall(r"\(([\d,]+\.\d+)\)", out["reply"])}
+        assert mentioned, "reply should state catalog prices"
+        assert mentioned <= catalog_prices
+        assert "19999" not in out["reply"]
+
+
+def test_order_tracking_uses_correct_order():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        row = T.get_order_status("RD100235", cid)
+        out = generate_reply("Where is my previous order?", cid, model="mock")
+        assert out["order"] and out["order"]["order_number"] == "RD100235"
+        assert row["tracking_number"] and row["tracking_number"] in out["reply"]
+        assert row["order_status"] in out["reply"]
+
+
+def test_refund_grounded_and_unknown_order_empty():
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        out = generate_reply("When will I get my refund?", cid, model="mock")
+        rows = T.get_refund_status(customer_id=cid)
+        assert rows
+        assert str(rows[0]["amount"])[:3] in out["reply"]
+        assert rows[0]["status"] in out["reply"]
+        assert T.get_refund_status(order_ref="RD999999", customer_id=cid) == []
+        assert T.get_return_status(order_ref="RD999999", customer_id=cid) == []
+
+
+def test_return_eligibility_window_and_unknown():
+    from datetime import date, timedelta
+    from models import Order as _Order
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        old = _Order(order_number="RD100001", customer_id=cid, total_amount=100.0,
+                     payment_status="PAID", order_status="DELIVERED", delivery_status="DELIVERED",
+                     order_date="2020-01-01", expected_delivery_date="2020-01-05",
+                     tracking_number="TRKX", product="Old Gadget", quantity=1, price=100.0)
+        recent = _Order(order_number="RD100002", customer_id=cid, total_amount=50.0,
+                        payment_status="PAID", order_status="DELIVERED", delivery_status="DELIVERED",
+                        order_date=(date.today() - timedelta(days=10)).isoformat(),
+                        expected_delivery_date=(date.today() - timedelta(days=5)).isoformat(),
+                        tracking_number="TRKY", product="New Gadget", quantity=1, price=50.0)
+        db.session.add_all([old, recent])
+        db.session.commit()
+        e = T.get_return_eligibility("RD100001", cid)
+        assert e["eligible"] is False and "30-day" in e["reason"]
+        e = T.get_return_eligibility("RD999999", cid)
+        assert e["ok"] is False and e["eligible"] is False
+        assert "RD999999" in e["reason"]
+        assert T.get_return_eligibility("RD100002", cid)["eligible"] is True
+
+
+def test_return_window_boundary_days():
+    from datetime import date, timedelta
+    from models import Order as _Order
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        edge = _Order(order_number="RD100010", customer_id=cid, total_amount=10.0,
+                      payment_status="PAID", order_status="DELIVERED", delivery_status="DELIVERED",
+                      order_date=(date.today() - timedelta(days=35)).isoformat(),
+                      expected_delivery_date=(date.today() - timedelta(days=30)).isoformat(),
+                      tracking_number="TRKA", product="Edge", quantity=1, price=10.0)
+        over = _Order(order_number="RD100011", customer_id=cid, total_amount=10.0,
+                      payment_status="PAID", order_status="DELIVERED", delivery_status="DELIVERED",
+                      order_date=(date.today() - timedelta(days=40)).isoformat(),
+                      expected_delivery_date=(date.today() - timedelta(days=31)).isoformat(),
+                      tracking_number="TRKB", product="Over", quantity=1, price=10.0)
+        db.session.add_all([edge, over])
+        db.session.commit()
+        assert T.get_return_eligibility("RD100010", cid)["eligible"] is True
+        e = T.get_return_eligibility("RD100011", cid)
+        assert e["eligible"] is False and "30-day" in e["reason"]
+
+
+def test_eligibility_route_unknown_ref_reports_not_found():
+    app = _fresh_app()
+    c = app.test_client()
+    token = c.post("/api/auth/login",
+                   json={"email": DEMO, "password": "Demo123!"}).get_json()["token"]
+    j = c.get("/api/returns/eligibility/RD999999",
+              headers={"Authorization": f"Bearer {token}"}).get_json()
+    assert j["eligible"] is False and j["ok"] is False
+
+
+def test_warranty_record_and_unknown_product():
+    from models import Product as _Product
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        p = _Product(product_name="No Warranty Gadget", name="No Warranty Gadget",
+                     brand="Test", category="misc", price=10.0, stock_quantity=5)
+        db.session.add(p)
+        db.session.commit()
+        out = generate_reply("What is the warranty of No Warranty Gadget?", cid, model="mock")
+        assert "1 year" in out["reply"]
+        out = generate_reply("What is the warranty of Unicorn Phone X99?", cid, model="mock")
+        assert "1 year" not in out["reply"]
+        assert "not available" in out["reply"].lower()
+
+
+def test_gemini_prompt_embeds_verified_rows(monkeypatch):
+    import services.ai as ai
+    app = _fresh_app()
+    cid = _demo_id(app)
+    with app.app_context():
+        captured = {}
+
+        def fake_call(prompt):
+            captured["prompt"] = prompt
+            return ("Canned grounded answer.", "test-model",
+                    {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+
+        monkeypatch.setattr(ai, "_call_gemini", fake_call)
+        out = ai.generate_reply("Show me Samsung phones under 30000", cid, model="gemini")
+        assert "16999" in captured["prompt"] and "Galaxy A15" in captured["prompt"]
+        assert out["model_used"] == "gemini:test-model"
+        assert out["reply"] == "Canned grounded answer."
+
+
+def test_policy_text_from_kb():
+    app = _fresh_app()
+    with app.app_context():
+        assert "30 days" in (T.get_policy_text("returns") or "")
+        assert "24 hours" in (T.get_policy_text("refunds") or "")
+        assert T.get_policy_text("no-such-policy") is None
+
+
 # ---------------- multi-turn / quality ----------------
 
 def test_multi_turn_cheapest_followup():
@@ -261,6 +491,8 @@ def test_mock_reply_has_no_config_warning():
 # ---------------- db / deploy config ----------------
 
 def test_vercel_sqlite_goes_to_tmp(monkeypatch):
+    # Pin DATABASE_URL to the default so this holds under isolated runs too.
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///support.db")
     monkeypatch.setenv("VERCEL", "1")
     assert resolve_database_url() == "sqlite:////tmp/support.db"
 

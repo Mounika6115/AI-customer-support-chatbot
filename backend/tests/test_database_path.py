@@ -4,15 +4,24 @@ from app import create_app
 from models import User, db
 
 
-def test_app_uses_backend_sqlite_path_and_seeded_demo_account():
+def test_app_uses_backend_sqlite_path_and_seeded_demo_account(monkeypatch, tmp_path):
+    from app import resolve_database_url
+
+    # Path resolution is pure (no DB write): pin the default URL explicitly so
+    # this assertion holds even when the suite runs on an isolated temp DB.
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    monkeypatch.delenv("LAMBDA_TASK_ROOT", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///support.db")
+    backend_db = (Path(__file__).resolve().parents[1] / "support.db").as_posix()
+    db_uri = resolve_database_url()
+    assert db_uri.endswith(f"/{backend_db.split('/')[-1]}")
+    assert db_uri.startswith("sqlite:////")
+    # Seeded-demo check runs on an isolated temp DB so backend/support.db is
+    # never created, dropped, or modified by this test.
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/isolated.db")
     app = create_app()
-
     with app.app_context():
-        db_uri = app.config["SQLALCHEMY_DATABASE_URI"]
-        backend_db = (Path(__file__).resolve().parents[1] / "support.db").as_posix()
-
-        assert db_uri.endswith(f"/{backend_db.split('/')[-1]}")
-        assert db_uri.startswith("sqlite:////")
         assert User.query.filter_by(email="customer@example.com").first() is not None
 
 
