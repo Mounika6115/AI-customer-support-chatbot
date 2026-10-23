@@ -23,7 +23,6 @@ INTENTS = {
     "RETURN_STATUS": ["return status", "where is my return", "return request status",
                       "return update", "return pickup"],
     "RETURN_ELIGIBILITY": ["eligible for return", "can i return", "return policy",
-                           "refund policy", "shipping policy", "warranty policy",
                            "return eligibility", "return window", "how to return"],
     "SERVICE_REQUEST": ["service request", "raise a service", "raise a repair",
                         "repair request", "need repair", "need service", "need a service",
@@ -106,6 +105,30 @@ def list_models():
     return out
 
 COMPARATIVE_HINTS = ["cheapest", "lowest price", "best", "recommend", "which one", "compare"]
+COMPARISON_HINTS = ["compare", "comparison", "vs", "versus"]
+REPLACEMENT_HINTS = ["replacement", "replace my", "replace the", "replace order",
+                    "replace product", "exchange", "send a new"]
+
+
+def _is_comparison(text):
+    low = (text or "").lower()
+    return any(h in low for h in COMPARISON_HINTS)
+
+
+def _extract_brands(text):
+    """All brand mentions in the text, not just the first one.
+
+    Comparisons can name two different products/brands ("Compare Pulse Pro
+    with Nova X1 Smartphone"); a single-brand lookup would silently drop the
+    other half of the comparison.
+    """
+    t = (text or "").lower()
+    found, seen = [], set()
+    for b in BRANDS:
+        if b in t and b not in seen:
+            seen.add(b)
+            found.append(b)
+    return found
 
 
 def detect_intent(text):
@@ -163,13 +186,15 @@ def priority(intent, sent):
     return "LOW"
 
 
+BRANDS = ["samsung", "apple", "nova", "aero", "pulse", "orbit", "sony", "oneplus",
+          "xiaomi", "boat", "noise", "dell", "hp", "lenovo",
+          "volt", "voltas", "lg", "daikin", "tcl", "tabone", "chillpro",
+          "frostcool", "visionmax", "novaview"]
+
+
 def _extract_brand(text):
-    brands = ["samsung", "apple", "nova", "aero", "pulse", "orbit", "sony", "oneplus",
-              "xiaomi", "boat", "noise", "dell", "hp", "lenovo",
-              "volt", "voltas", "lg", "daikin", "tcl", "tabone", "chillpro",
-              "frostcool", "visionmax", "novaview"]
-    t = text.lower()
-    for b in brands:
+    t = (text or "").lower()
+    for b in BRANDS:
         if b in t:
             return b
     return None
@@ -226,24 +251,143 @@ def _looks_like_product_query(text):
     return any(k in low for k in keys)
 
 
-def _recall_product_context(conversation_history):
-    """Find products mentioned earlier so 'which one is cheapest?' resolves."""
+def _names_specific_product(text):
+    """True when the text points at a product/brand/category not in the catalogue.
+
+    Used to avoid answering a generic warranty policy when the customer asked
+    about a specific product we could not verify.
+    """
+    if _named_products(text):
+        return False
+    if _extract_brand(text) or _extract_category(text) or _extract_price_cap(text):
+        return True
+    return bool(re.search(r"\b[a-z]{2,}\d+[a-z0-9]*\b", (text or "").lower()))
+
+
+def _recall_product_context(conversation_history, latest_only=False):
+    """Products mentioned earlier, newest mention first.
+
+    Scans newest-to-oldest so a follow-up ("What is its warranty?") attaches
+    to the product discussed most recently instead of the first product in the
+    thread. With ``latest_only`` only the most recent turn that mentions a
+    product is used (right for pronouns like "its price"); otherwise all
+    remembered products are returned (right for "which one is cheapest?").
+    Only the supplied conversation history is used, so different
+    users/conversations never share product context (the catalogue itself is
+    public).
+    """
     if not conversation_history:
         return []
-    remembered = []
-    for turn in conversation_history[-10:]:
+    out, seen = [], set()
+    for turn in reversed(conversation_history[-10:]):
         c = turn.get("content", "") if isinstance(turn, dict) else getattr(turn, "content", "")
+        c = (c or "").lower()
+        if not c:
+            continue
+        found = []
         for p in Product.query.all():
+            if p.id in seen:
+                continue
             names = [n for n in [p.product_name, p.name, p.brand] if n]
-            if any(n.lower() in (c or "").lower() for n in names if len(n) > 2):
-                remembered.append(p.to_dict())
-    # de-dupe
-    seen, out = set(), []
-    for d in remembered:
-        if d["id"] not in seen:
+            if any(n.lower() in c for n in names if len(n) > 2):
+                found.append(p.to_dict())
+        for d in found:
             seen.add(d["id"])
             out.append(d)
+        if found and latest_only:
+            break
     return out
+
+
+PRODUCT_ATTRIBUTE_HINTS = ["price", "cost", "how much", "warranty", "spec",
+                           "specification", "stock", "availability", "available",
+                           "rating", "discount", "return policy", "returns",
+                           "feature", "colour", "color", "battery"]
+
+
+def _is_product_followup(text):
+    """True for pronoun/attribute follow-ups like 'What is its price?'.
+
+    Explicitly named products, brands, categories, orders, and service flows
+    keep their dedicated paths; only context-dependent questions use memory.
+    """
+    low = (text or "").lower().strip()
+    if not low:
+        return False
+    if _extract_brand(text) or _extract_category(text) or _extract_price_cap(text):
+        return False
+    if _extract_order_ref(text):
+        return False
+    if any(k in low for k in ("order", "track", "package", "repair", "service", "ticket")):
+        return False
+    has_pronoun = bool(re.search(r"\b(it|its|this|that|these|those|same)\b", low))
+    has_attribute = any(h in low for h in PRODUCT_ATTRIBUTE_HINTS)
+    return has_attribute and (has_pronoun or len(low.split()) <= 5)
+
+
+def _named_products(text):
+    """Catalogue products explicitly named in the text (model/name matches)."""
+    t = (text or "").lower()
+    if not t:
+        return []
+    products = Product.query.all()
+    first_word_counts = {}
+    for p in products:
+        words = (p.product_name or p.name or "").strip().lower().split()
+        if words:
+            first_word_counts[words[0]] = first_word_counts.get(words[0], 0) + 1
+    out, seen = [], set()
+    for p in products:
+        if p.id in seen:
+            continue
+        d = p.to_dict()
+        words = (d.get("product_name") or "").strip().lower().split()
+        if not words:
+            continue
+        keys = {" ".join(words)}
+        if len(words) >= 3:
+            keys.add(" ".join(words[:-1]))   # drop trailing category word
+            keys.add(" ".join(words[:2]))
+        elif len(words) == 2:
+            keys.add(" ".join(words[:2]))
+        # A unique leading model word ("AeroBook", "Orbit", "TabOne") is a
+        # strong identifier; shared leading words ("Galaxy") are not.
+        if len(words[0]) > 3 and first_word_counts.get(words[0]) == 1:
+            keys.add(words[0])
+        if any(k and len(k) > 2 and k in t for k in keys):
+            seen.add(p.id)
+            out.append(d)
+    return out
+
+
+def _comparison_products(text, category=None, max_price=None):
+    """All products the customer asked to compare (verified catalogue rows).
+
+    Explicit product-name matches come first so a category word from one half
+    of the comparison (e.g. "Watch" in "Pulse Pro with Orbit Watch") cannot
+    filter out the other product. Brand-only comparisons fall back to a
+    per-brand lookup.
+    """
+    named = _named_products(text)
+    if named:
+        ids = {p["id"] for p in named}
+        for b in _extract_brands(text):
+            if any((p.get("brand") or "").lower() == b for p in named):
+                continue
+            for p in T.search_products(query="", brand=b, category=category,
+                                       max_price=max_price, limit=8):
+                if p["id"] not in ids:
+                    ids.add(p["id"])
+                    named.append(p)
+        return named
+    merged, seen = [], set()
+    for b in (_extract_brands(text) or [None]):
+        for p in T.search_products(query=text, brand=b, category=category,
+                                   max_price=max_price, limit=8):
+            if p["id"] not in seen:
+                seen.add(p["id"])
+                merged.append(p)
+    return merged
 
 
 ORDER_FOLLOWUP_HINTS = ["it", "when will", "arrive", "deliver", "package",
@@ -379,30 +523,52 @@ def grounded_context(text, customer_id, conversation_history=None):
     brand = _extract_brand(text)
     category = _extract_category(text)
     cap = _extract_price_cap(text)
+    intent = detect_intent(text)
     wants_products = (brand or category or cap is not None or
                       any(k in text.lower() for k in ["show me", "buy", "looking for", "need a", "product", "price", "stock", "available"]))
 
-    if wants_products or detect_intent(text) == "PRODUCT_INFORMATION":
-        # Pronoun/comparative follow-up ("which one is cheapest?") resolves from
-        # conversation memory instead of a fresh keyword search — otherwise words
-        # like "one" substring-match "headphones"/"phones" and return everything.
-        is_followup = (brand is None and category is None and cap is None and
-                       any(h in text.lower() for h in COMPARATIVE_HINTS))
-        if is_followup:
-            recalled = _recall_product_context(conversation_history or [])
+    if (wants_products or intent == "PRODUCT_INFORMATION"
+            or _is_comparison(text) or _is_product_followup(text)):
+        # Pronoun/attribute follow-ups ("What is its price?", "which one is
+        # cheapest?") resolve from conversation memory instead of a fresh
+        # keyword search — otherwise words like "one" substring-match
+        # "headphones"/"phones" and return everything.
+        comparative_followup = (brand is None and category is None and cap is None and
+                                any(h in text.lower() for h in COMPARATIVE_HINTS))
+        product_followup = _is_product_followup(text)
+        if comparative_followup or product_followup:
+            recalled = _recall_product_context(
+                conversation_history or [],
+                latest_only=product_followup and not comparative_followup)
             if recalled:
-                products = sorted(recalled, key=lambda p: p.get("price", 0))
-            else:
+                products = recalled
+                if comparative_followup:
+                    products = sorted(products, key=lambda p: p.get("price", 0))
+            elif comparative_followup:
                 products = T.search_products(query="", limit=8)
         else:
             products = T.search_products(query=text, brand=brand,
                                          category="smartphone" if category == "smartphone" else category,
                                          max_price=cap, limit=8)
-        # pronoun follow-up: "which one is cheapest?" -> reuse previous products
-        if not products and any(h in text.lower() for h in COMPARATIVE_HINTS):
-            products = _recall_product_context(conversation_history or [])
-            if products:
-                products = sorted(products, key=lambda p: p.get("price", 0))
+            # pronoun follow-up: "which one is cheapest?" -> reuse previous products
+            if not products and any(h in text.lower() for h in COMPARATIVE_HINTS):
+                products = _recall_product_context(conversation_history or [])
+                if products:
+                    products = sorted(products, key=lambda p: p.get("price", 0))
+        # Comparison queries can name products from different categories, e.g.
+        # "Compare Pulse Pro with Orbit Watch". Resolve every named product
+        # before applying filters so neither half of the comparison is dropped.
+        if _is_comparison(text):
+            compared = _comparison_products(text, category=category, max_price=cap)
+            if compared:
+                products = sorted(compared, key=lambda p: p.get("price") or 0)
+
+    # Warranty questions are product questions: resolve the subject product
+    # from recent conversation memory so follow-ups ("What is its warranty?"
+    # after "Tell me about AeroBook.") keep the discussed product's context.
+    if not products and (intent in ("WARRANTY", "WARRANTY_CLAIM")
+                         or "warranty" in text.lower()):
+        products = _recall_product_context(conversation_history or [], latest_only=True)
 
     # order lookup: explicit RD/HASH ref, pronoun follow-up ("when will it
     # arrive?" reuses the order from conversation memory), or order keywords.
@@ -476,6 +642,9 @@ def grounded_context(text, customer_id, conversation_history=None):
                      f"status={service_info.get('status')} pickup={service_info.get('pickup_status')} "
                      f"delivery={service_info.get('delivery_status')}")
     parts.extend(extra)
+    import os as _os4
+    if _os4.environ.get("CHATBOT_DEBUG_PARTS"):
+        print("DEBUG_C parts after extend:", parts, "len:", len(parts), "service_info:", service_info, "extra:", extra)
     if not parts:
         # ultimate fallback: legacy keyword scan so KB/order grounding never regresses.
         # Order fallback is private: skipped on phone mismatch (fail closed).
@@ -500,6 +669,11 @@ def grounded_context(text, customer_id, conversation_history=None):
         for k in KnowledgeBase.query.all():
             if any(w in low for w in (k.title or "").lower().split() if len(w) > 4):
                 return (f"Knowledge article: {k.title}: {k.content}", [], None)
+    import os as _os
+    if _os.environ.get("CHATBOT_DEBUG_PARTS"):
+        print("DEBUG_PARTS:", parts)
+        print("DEBUG_PRODUCTS:", products)
+        print("DEBUG_ORDER:", order_info)
     return ("; ".join(parts), products, order_info)
 
 
@@ -596,6 +770,56 @@ def _resolve_active_order(text, customer_id, conversation_history, order_info):
     return orders[0] if orders else None
 
 
+def _has_terms(text, terms):
+    """Whole-word/phrase match (so "AeroBook" never triggers the verb "book")."""
+    low = (text or "").lower()
+    for term in terms:
+        if " " in term:
+            if term in low:
+                return True
+        elif re.search(rf"\b{re.escape(term)}\b", low):
+            return True
+    return False
+
+
+ACTION_TERMS = [
+    "i want to", "i'd like to", "please", "request", "raise", "book a",
+    "book an", "book service", "book repair", "initiate", "create", "ticket",
+    "cancel my", "cancel the", "return my", "send back", "damaged", "broken",
+    "defective", "not working", "cracked", "dent", "not cooling",
+    "no cooling", "install", "setup", "set up", "repair", "service", "claim",
+]
+
+INFO_QUESTION_PREFIXES = ("how", "what", "when", "where", "why", "which", "who",
+                          "is ", "are ", "do ", "does ", "did ", "do i",
+                          "will ", "would ", "should ", "can i",
+                          "could i", "tell me", "explain")
+
+
+def _is_info_question(text):
+    """True for questions ("How do I return…?") vs explicit action requests."""
+    return (text or "").lower().strip().startswith(INFO_QUESTION_PREFIXES)
+
+
+def _order_matches_products(order, products):
+    """True when one of the named products is on the order (or no product named)."""
+    if not products:
+        return True
+    order_ids = {i.get("product_id") for i in (order or {}).get("items") or []
+                 if i.get("product_id")}
+    order_text = " ".join(str(x or "") for x in [
+        (order or {}).get("product"),
+        *[(i.get("product_name") or "") for i in (order or {}).get("items") or []],
+    ]).lower()
+    for p in products:
+        if p.get("id") in order_ids:
+            return True
+        name = (p.get("product_name") or "").lower()
+        if name and name in order_text:
+            return True
+    return False
+
+
 def _execute_support_action(intent, text, customer_id, conversation_history,
                             order_info, products):
     """Run DB-backed support actions directly from chat.
@@ -616,13 +840,7 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
         return ({"type": "unknown_order", "ok": False, "order_ref": unknown_ref},
                 f"I couldn't find order {unknown_ref} on your account. "
                 f"Please check the order number and try again.", None)
-    explicit_write = any(v in low for v in [
-        "i want to", "i'd like to", "please", "request", "raise", "book",
-        "initiate", "create", "ticket", "cancel my", "cancel the", "return my",
-        "send back", "damaged", "broken", "defective", "not working", "cracked",
-        "dent", "not cooling", "no cooling", "install", "setup", "set up",
-        "repair", "service", "claim",
-    ])
+    explicit_write = _has_terms(low, ACTION_TERMS)
 
     # ---- cancel order ----
     if intent == "ORDER_CANCEL":
@@ -659,10 +877,35 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
             return ({"type": "return_status", "ok": True, "return": r},
                     f"Return #{r['id']} for order {r['order_id']} is currently: {r['status']}. "
                     f"Reason recorded: {r.get('reason', '')}", None)
+        # If the customer names a product that is not on the active order,
+        # never return a different order's item by default.
+        if (not _is_info_question(low) and not _extract_order_ref(text)
+                and products and order and not _order_matches_products(order, products)):
+            names = ", ".join(dict.fromkeys(
+                (i.get("product_name") or "") for i in (order.get("items") or [])
+                if i.get("product_name"))) or order.get("product") or "a different product"
+            return ({"type": "return_request", "ok": False,
+                     "order_number": order.get("order_number")},
+                    f"The latest order {order.get('order_number')} is for {names}, "
+                    f"not the {products[0]['product_name']} you mentioned. "
+                    f"Please share the order number for the item you want to return.", None)
+        # A product-specific return-policy question (often a pronoun follow-up)
+        # is answered from the product row, not an unrelated latest order.
+        if ((intent == "RETURN_ELIGIBILITY" or _is_info_question(low))
+                and products and not _extract_order_ref(text)):
+            p = products[0]
+            returns_policy = T.get_policy_text("returns")
+            policy_note = f" {returns_policy}" if returns_policy else ""
+            return ({"type": "return_eligibility", "ok": True,
+                     "product_id": p["id"]},
+                    f"{p['product_name']}: return policy "
+                    f"{p.get('return_policy') or '30-day return'}.{policy_note} "
+                    f"Say 'I want to return {p['product_name']}' to start a return.", None)
         elig = T.get_return_eligibility(
             (order.get("order_number") if order else ""), customer_id)
-        if intent == "RETURN_ELIGIBILITY" and not any(
-                v in low for v in ["i want to", "request", "raise", "initiate", "send back"]):
+        # Informational questions ("How do I return…?", "Can I return…?")
+        # get the real policy/eligibility without creating a return.
+        if intent == "RETURN_ELIGIBILITY" or _is_info_question(low):
             if elig.get("eligible"):
                 returns_policy = T.get_policy_text("returns")
                 window_msg = returns_policy or "Returns are accepted within the 30-day window."
@@ -706,6 +949,10 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                     f"No refund record yet for order {order.get('order_number')} "
                     f"(status {order.get('order_status')}). {timing} "
                     f"Please share your payment details so I can help verify.", None)
+        refund_policy = T.get_policy_text("refunds")
+        if refund_policy:
+            return ({"type": "refund_status", "ok": False},
+                    f"I couldn't find a refund on your account yet. {refund_policy}", None)
         return (None, None, None)  # fall through to generic guidance
 
     # ---- order details / tracking ----
@@ -748,21 +995,43 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
             return ({"type": "service_status", "ok": True, "service": s},
                     f"Service {s['request_number']} ({s['issue_type']}): status {s['status']}, "
                     f"pickup {s['pickup_status']}, delivery {s['delivery_status']}.", s)
-        # warranty info question without repair intent -> answer from DB, no ticket
-        info_only = intent in ("WARRANTY", "INSTALLATION_HELP") and not any(
-            v in low for v in ["raise", "request", "book", "claim", "schedule",
-                               "damaged", "broken", "defective", "not working", "repair", "service"])
-        if info_only and (products or order):
+        # Warranty / installation questions are answered from verified DB
+        # product + policy rows, never by opening a ticket. Whole-word
+        # matching avoids false positives such as "AeroBook" -> "book".
+        warranty_info_intent = intent in ("WARRANTY", "WARRANTY_CLAIM", "INSTALLATION_HELP")
+        strong_action = _has_terms(low, [
+            "claim", "raise", "book a", "book an", "book installation",
+            "book service", "book repair", "schedule", "repair", "service",
+            "damaged", "broken", "defective", "not working", "cracked",
+            "dent", "install",
+        ])
+        if intent in ("SERVICE_REQUEST", "DAMAGED_PRODUCT"):
+            action_requested = True
+        elif warranty_info_intent:
+            action_requested = strong_action and not _is_info_question(low)
+        else:
+            action_requested = explicit_write
+
+        if warranty_info_intent and not action_requested:
             p = (products or [None])[0]
             if p:
                 w = T.get_warranty(product_id=p["id"])
                 period = (w.get("period") if isinstance(w, dict)
                           else p.get("warranty_period") or p.get("warranty") or T.WARRANTY_DEFAULT_PERIOD)
-                extra = ""
+                status = w.get("status") if isinstance(w, dict) else "ACTIVE"
+                policy_cat = "installation" if intent == "INSTALLATION_HELP" else "warranty"
+                policy = T.get_policy_text(policy_cat)
                 if intent == "INSTALLATION_HELP":
-                    extra = " For setup, check the user manual in the box; if you'd like a technician visit, say 'book installation'."
+                    extra = f" {policy}" if policy else " For setup, check the user manual in the box."
+                    extra += (" If you'd like a technician visit, say 'book installation' "
+                              "and I'll create a service request.")
+                elif intent == "WARRANTY_CLAIM":
+                    extra = (" To claim, share the order number and say "
+                             "'raise a warranty claim' and I'll create a service request.")
+                else:
+                    extra = ""
                 return ({"type": "warranty_info", "ok": True},
-                        f"{p['product_name']}: warranty {period}, "
+                        f"{p['product_name']}: warranty {period} (status {status}), "
                         f"availability {'in stock' if p.get('in_stock') else 'out of stock'} "
                         f"(stock {p.get('stock_quantity', 0)}), price {p.get('price')}. "
                         f"Return policy: {p.get('return_policy')}.{extra}", None)
@@ -778,8 +1047,26 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                             f"Order {order.get('order_number')} warranty: "
                             f"{w.get('period')} (status {w.get('status')}). "
                             f"Say 'claim warranty for order {order.get('order_number')}' to raise a claim.", None)
+            policy_cat = "installation" if intent == "INSTALLATION_HELP" else "warranty"
+            policy = T.get_policy_text(policy_cat)
+            # A named-but-unknown product must not be answered with the
+            # generic policy; let the caller report it as unavailable.
+            if policy and _names_specific_product(text):
+                return (None, None, None)
+            if policy:
+                if intent == "INSTALLATION_HELP":
+                    return ({"type": "warranty_info", "ok": True}, policy, None)
+                if intent == "WARRANTY_CLAIM":
+                    return ({"type": "warranty_info", "ok": True},
+                            f"{policy} To claim, share the order number and say "
+                            f"'raise a warranty claim' and I'll create a service request.", None)
+                return ({"type": "warranty_info", "ok": True},
+                        f"{policy} Please share the product or order number and "
+                        f"I'll confirm the exact warranty for it.", None)
+            return (None, None, None)
+
         # explicit service/repair/install/damage/warranty-claim -> create request
-        if explicit_write or intent in ("SERVICE_REQUEST", "DAMAGED_PRODUCT", "WARRANTY_CLAIM"):
+        if action_requested:
             issue = "REPAIR"
             if any(k in low for k in ["install", "setup", "set up"]):
                 issue = "INSTALLATION"
@@ -789,21 +1076,117 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                 issue = "DAMAGED"
             elif any(k in low for k in ["defect", "not working", "dead"]):
                 issue = "DEFECTIVE"
+            product_id = products[0]["id"] if products else None
+            order_ref = order.get("order_number") if order else None
+            # Never attach an unrelated latest order when the customer named
+            # a different product (e.g. "my AC" while the latest order is a phone).
+            if (product_id and order and not _extract_order_ref(text)
+                    and not _order_matches_products(order, products)):
+                order_ref = None
             res = T.create_service_request(
                 customer_id, issue_type=issue,
                 description=text.strip()[:500],
-                order_ref=(order.get("order_number") if order else None),
+                order_ref=order_ref, product_id=product_id,
                 warranty_claim=(issue == "WARRANTY"))
             if res.get("ok"):
+                warranty_note = ""
+                if issue == "WARRANTY" and products:
+                    w = T.get_warranty(product_id=products[0]["id"])
+                    if isinstance(w, dict) and w.get("period"):
+                        warranty_note = f" The recorded warranty is {w['period']}."
                 return ({"type": "service_request", **res},
                         f"Service request {res['request_number']} created ({res['issue_type']}) — "
-                        f"status {res['status']}. We'll schedule pickup shortly; "
+                        f"status {res['status']}.{warranty_note} We'll schedule pickup shortly; "
                         f"ask 'status of my repair' anytime for updates.", res)
             return ({"type": "service_request", **res},
                     f"I couldn't create the service request: {res.get('error')}", None)
         return (None, None, None)
 
     return (None, None, None)
+
+
+def _fmt_price(value):
+    """Format DB prices without trailing .0 (149.0 -> 149)."""
+    if isinstance(value, (int, float)):
+        return f"{float(value):g}"
+    return str(value) if value not in (None, "") else "unknown"
+
+
+def _clean_field(value):
+    """Trim a DB text field and its trailing period for inline embedding."""
+    text = str(value).strip() if value not in (None, "") else ""
+    return text.rstrip(".")
+
+
+ATTRIBUTE_KEYS = [
+    ("price", ["price", "cost", "how much"]),
+    ("warranty", ["warranty", "guarantee"]),
+    ("specifications", ["specification", "specs", "feature"]),
+    ("stock", ["stock", "availability", "available"]),
+    ("rating", ["rating", "review"]),
+    ("return policy", ["return policy", "returns"]),
+]
+
+
+def _product_attribute_answer(products, lowered):
+    """Answer a specific attribute question from the remembered product rows.
+
+    Used for follow-ups such as "What is its price?", "Is it in stock?", or
+    "What are its specifications?" after a product was discussed. Returns
+    None when the question does not ask for a known attribute.
+    """
+    wanted = [label for label, keys in ATTRIBUTE_KEYS
+              if any(k in lowered for k in keys)]
+    if not wanted:
+        return None
+    rows = []
+    for p in products[:4]:
+        parts = []
+        if "price" in wanted:
+            parts.append(f"price {_fmt_price(p.get('price'))}")
+        if "warranty" in wanted:
+            parts.append(f"warranty {p.get('warranty_period') or p.get('warranty') or 'not available'}")
+        if "specifications" in wanted:
+            parts.append(f"specifications {_clean_field(p.get('specifications')) or 'not specified'}")
+        if "stock" in wanted:
+            parts.append(f"{'in stock' if p.get('in_stock') else 'out of stock'} "
+                         f"(stock {p.get('stock_quantity', 0)})")
+        if "rating" in wanted:
+            parts.append(f"rating {p.get('rating', 0)}")
+        if "return policy" in wanted:
+            parts.append(f"return policy {p.get('return_policy') or 'not available'}")
+        rows.append(f"{p.get('product_name') or p.get('name')}: " + "; ".join(parts) + ".")
+    return "\n".join(rows)
+
+
+def _comparison_reply(products):
+    """Side-by-side comparison grounded in verified DB rows (Jira: comparison
+    must surface product name, price, specifications, warranty, availability).
+    Prices/specs/warranty come from the product dicts (DB) — never hard-coded."""
+    if not products:
+        return ("I could not find verified product details to compare. "
+                "Please share the product names you would like me to compare.")
+    lines = []
+    for p in products[:4]:
+        price = p.get("price")
+        price_s = _fmt_price(price)
+        original = p.get("original_price")
+        mrp_s = ""
+        if isinstance(original, (int, float)) and isinstance(price, (int, float)) and original > price:
+            mrp_s = f" (MRP {_fmt_price(original)})"
+        warranty = p.get("warranty_period") or p.get("warranty") or "not available"
+        identity = " ".join(x for x in [p.get("brand"), p.get("category")] if x)
+        name = p.get("product_name") or p.get("name") or f"Product #{p.get('id')}"
+        lines.append(
+            f"- {name}" + (f" ({identity})" if identity else "") + ": "
+            f"price {price_s}{mrp_s}; warranty {warranty}; "
+            f"specifications {_clean_field(p.get('specifications')) or 'not specified'}; "
+            f"availability {'in stock' if p.get('in_stock') else 'out of stock'}; "
+            f"stock {p.get('stock_quantity', 0)}; rating {p.get('rating', 0)}; "
+            f"return policy {_clean_field(p.get('return_policy')) or 'not available'}; "
+            f"description {_clean_field(p.get('description')) or 'not available'}"
+        )
+    return ("Here is the comparison from our verified catalogue:\n" + "\n".join(lines))
 
 
 def _mock_support_reply(text, intent, ctx, products=None, order_info=None,
@@ -818,6 +1201,16 @@ def _mock_support_reply(text, intent, ctx, products=None, order_info=None,
                 f"{order_info.get('order_status')} ({order_info.get('delivery_status') or order_info.get('delivery')}). "
                 f"Expected delivery: {order_info.get('expected_delivery_date') or order_info.get('expected') or 'see tracking'}. "
                 f"Total: {order_info.get('total_amount')}.")
+    if any(h in lowered for h in REPLACEMENT_HINTS):
+        # Replacement / exchange questions: answer only from verified context,
+        # never invent replacement eligibility.
+        if order_info or products:
+            who = (order_info or {}).get("product") or (products or [{}])[0].get("product_name") or "your product"
+            return (f"I could not verify a replacement for {who} from the latest records. "
+                    "If the product is defective or damaged, I can raise a service request "
+                    "(repair/replacement) for you — share your order number or what went wrong.")
+        return ("I could not find verified replacement information for that product. "
+                "If it is defective or damaged, I can help you raise a repair or replacement service request.")
     if products:
         if any(h in lowered for h in ["cheapest", "lowest"]):
             best = min(products, key=lambda p: p.get("price", 1e12))
@@ -827,6 +1220,13 @@ def _mock_support_reply(text, intent, ctx, products=None, order_info=None,
             best = max(products, key=lambda p: (p.get("rating", 0), -p.get("price", 0)))
             return (f"Based on rating and price, I recommend {best['product_name']} at {best['price']} "
                     f"(rating {best.get('rating', 0)}). All options above come from our live catalogue.")
+        if _is_comparison(text):
+            # Real comparison: side-by-side from verified rows (name, price,
+            # specifications, warranty, availability) instead of a plain list.
+            return _comparison_reply(products)
+        attribute_answer = _product_attribute_answer(products, lowered)
+        if attribute_answer:
+            return attribute_answer
         names = ", ".join(f"{p['product_name']} ({p['price']})" for p in products[:5])
         return f"Here are some options from our catalogue: {names}."
     if "password" in lowered or "reset" in lowered or "login" in lowered:
@@ -1018,7 +1418,10 @@ def generate_reply(text, customer_id, conversation_history=None, model="auto"):
     history_text = _format_history(conversation_history)
     product_lines = "\n".join(
         f"- id={p['id']} | {p['product_name']} | brand={p['brand']} | category={p['category']} | "
-        f"price={p['price']} | stock={p['stock_quantity']} | rating={p['rating']} | {p['description']}"
+        f"price={p['price']} | stock={p['stock_quantity']} | rating={p['rating']} | "
+        f"warranty={p.get('warranty_period') or p.get('warranty') or 'not available'} | "
+        f"specifications={p.get('specifications') or 'not specified'} | "
+        f"return_policy={p.get('return_policy') or 'not available'} | {p['description']}"
         for p in (products or [])[:8])
     order_line = (f"Order {order_info.get('order_number')}: status={order_info.get('order_status')}, "
                   f"delivery={order_info.get('delivery_status') or order_info.get('delivery')}, "
