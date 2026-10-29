@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from models import (db, User, ProductCategory, Product, Order, OrderItem,
                     Payment, ReturnRequest, Refund, Offer, Warranty, KnowledgeBase, Notification)
 
@@ -12,7 +12,25 @@ def _get_or_create_category(name, description=""):
     return c
 
 
+def is_production_env():
+    """Check if running in production environment."""
+    import os
+    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("LAMBDA_TASK_ROOT"):
+        return True
+    if os.getenv("ENV", "").strip().lower() in ("production", "prod"):
+        return True
+    if os.getenv("FLASK_ENV", "").strip().lower() == "production":
+        return True
+    if os.getenv("VERCEL_ENV", "").strip().lower() == "production":
+        return True
+    return False
+
+
 def seed():
+    if is_production_env():
+        # Prevent demo customer, admin, and agent accounts with password Demo123! from being created/reset in production
+        return
+
     for name, email, role in [
         ("Demo Customer", "customer@example.com", "customer"),
         ("Admin", "admin@example.com", "admin"),
@@ -101,7 +119,7 @@ def seed():
     # today so they stay inside the 30-day return window no matter when the
     # app is (re)started. Only the date strings move; statuses, amounts,
     # products, tracking, and payments are never touched here.
-    _today = datetime.utcnow().date()
+    _today = datetime.now(timezone.utc).date()
     if customer and not Order.query.filter_by(customer_id=customer.id).first():
         nova = Product.query.filter_by(product_name="Nova X1 Smartphone").first()
         pulse = Product.query.filter_by(product_name="Pulse Pro").first()

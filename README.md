@@ -2,8 +2,14 @@
 
 A full-stack e-commerce customer-support system: React/Vite + Flask + relational DB
 (SQLite by default, MySQL preferred for production) + JWT + Socket.IO-ready realtime +
-grounded Gemini/Mock AI. Pure-AI mode: every question is answered directly by the AI,
-no human-agent handoff, no escalation tickets.
+grounded Gemini/Mock AI. **Pure-AI mode:** every question is answered directly by the AI.
+No human-agent handoff or escalation tickets are created; if a customer requests a human,
+the AI politely responds with available contact options (e.g., support@supportflow.ai or +1-800-555-0199)
+and continues answering subsequent questions normally.
+
+**Fallback behavior:** If all live AI providers fail, the system returns a clear limited-mode message instead of misleading catalogue replies. Deterministic fallbacks are only used for reliable intents (e.g., order status, return eligibility). Provider errors are logged safely without exposing API keys or sensitive details.
+
+**Model selection:** Model selection is enforced server-side. Ordinary customers cannot arbitrarily select paid models — only admins may choose models, or selection is restricted by an operator-configured allowlist via `CUSTOMER_ALLOWED_MODELS`. The client-supplied `model` field is never trusted alone.
 
 ## Architecture
 

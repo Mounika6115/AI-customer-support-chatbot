@@ -1,26 +1,32 @@
-"""Public evaluation endpoint (no JWT) for external harnesses.
+"""Opt-in evaluation endpoint for trusted, authenticated harnesses.
 
-External evaluators (the "Case by case" dashboard in the screenshot) call
-the chatbot without a login token and with varying payload shapes:
-  {"message": ...} / {"query": ...} / {"input": ...} / {"text": ...}
-  + optional history: {"history": [...]} / {"messages": [...]}
-  (OpenAI-style [{role, content}] or [{role, text}]).
+This blueprint is registered only when ALL of the following are true:
+  * ``EVAL_ENABLED=1``
+  * ``EVAL_KEY`` is configured
+  * the app is not running in production/serverless mode
 
-Without this endpoint every case fails with 401
-"Your session is invalid..." which the dashboard shows as red `error`.
+Every request must also present the shared secret in ``X-Eval-Key``. The
+endpoint is disabled by default because it can expose customer data and was
+previously reachable without authentication.
 
-This blueprint auto-uses the seeded demo customer
-(customer@example.com), reuses one conversation per `conversation_id`
-(or per `session_id`), calls the same grounded generate_reply() as the
-authed /api/chat route, and returns every common reply key so strict
-parsers don't mark the case as error:
-  {"reply", "response", "output", "message", "answer"} (+ conversation_id).
+External evaluators may send a current message as
+``{"message": ...}`` / ``{"query": ...}`` / ``{"input": ...}`` / ``{"text": ...}``.
+Caller-supplied history/messages are deliberately ignored: only messages
+already stored for the selected conversation are treated as trusted context.
+Multi-turn evaluation must therefore pass ``conversation_id`` (or
+``session_id``) so prior turns can be loaded from the database.
+
+The blueprint auto-uses the seeded demo customer (customer@example.com) for
+read-only evaluation. State-changing support actions (cancellations, returns,
+service requests) are disabled unless the operator explicitly sets
+``EVAL_ALLOW_WRITES=1``.
 """
-from flask import Blueprint, request, jsonify
-from flask_cors import cross_origin
+import hmac
+import os
 
-from models import db, User, Conversation
-from routes.api import handle as authed_handle
+from flask import Blueprint, request, jsonify
+
+from models import db, User, Conversation, Message
 from services.ai import generate_reply
 
 eval_bp = Blueprint("eval", __name__)
@@ -28,10 +34,59 @@ eval_bp = Blueprint("eval", __name__)
 DEMO_EMAIL = "customer@example.com"
 
 
+def _eval_writes_enabled():
+    """State-changing chat actions need an explicit operator opt-in.
+
+    The shared eval key grants access to the evaluation surface, not the
+    right to mutate the seeded demo customer's orders/returns/service data.
+    """
+    return os.getenv("EVAL_ALLOW_WRITES", "").strip() == "1"
+
+
+def _provided_key_ok():
+    expected = os.getenv("EVAL_KEY", "").strip()
+    provided = (request.headers.get("X-Eval-Key") or "").strip()
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+@eval_bp.before_request
+def _require_eval_key():
+    """Protect every eval route, including health and stored results."""
+    if not _provided_key_ok():
+        return jsonify(error="Evaluation access denied"), 401
+    return None
+
+
+def _conversation_history(conversation_id):
+    """Trusted history comes from the DB only, never from the caller."""
+    rows = Message.query.filter_by(conversation_id=conversation_id).order_by(
+        Message.created_at.asc(), Message.id.asc()).all()
+    return [{"role": "customer" if m.sender_type == "CUSTOMER" else "ai",
+             "content": m.text} for m in rows]
+
+
+def is_production_env():
+    """Check if running in production environment."""
+    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("LAMBDA_TASK_ROOT"):
+        return True
+    if os.getenv("ENV", "").strip().lower() in ("production", "prod"):
+        return True
+    if os.getenv("FLASK_ENV", "").strip().lower() == "production":
+        return True
+    if os.getenv("VERCEL_ENV", "").strip().lower() == "production":
+        return True
+    return False
+
+
 def _demo_customer_id():
     u = User.query.filter_by(email=DEMO_EMAIL).first()
     if u:
         return u.id
+    if is_production_env():
+        # In production, don't create demo accounts
+        raise Exception("Demo accounts not allowed in production")
     u = User(name="Demo Customer", email=DEMO_EMAIL, role="customer")
     try:
         u.set_password("Demo123!")
@@ -54,47 +109,9 @@ def _extract_text(payload):
             parts = [str(x).strip() for x in v if str(x).strip()]
             if parts:
                 return " ".join(parts)
-    # OpenAI-style {"messages": [{"role":..,"content":..}]}
-    msgs = payload.get("messages")
-    if isinstance(msgs, list) and msgs:
-        last = msgs[-1]
-        if isinstance(last, dict):
-            for k in ("content", "text", "message", "input"):
-                if isinstance(last.get(k), str) and last[k].strip():
-                    return last[k].strip()
-        elif isinstance(last, str) and last.strip():
-            return last.strip()
+    # {"messages": [...]} / {"history": [...]} are caller-controlled context
+    # and are intentionally not trusted as the current message or as history.
     return ""
-
-
-def _extract_history(payload):
-    """Normalize any history shape to [{role, content}]."""
-    if not isinstance(payload, dict):
-        return []
-    raw = payload.get("history")
-    if raw is None:
-        raw = payload.get("messages")
-    if raw is None:
-        raw = payload.get("conversation_history")
-    if not isinstance(raw, list):
-        return []
-    out = []
-    for m in raw:
-        if isinstance(m, str):
-            out.append({"role": "customer", "content": m})
-        elif isinstance(m, dict):
-            role = str(m.get("role", m.get("sender", "customer"))).lower()
-            if "customer" in role or "user" in role or "human" in role:
-                role = "customer"
-            else:
-                role = "ai"
-            content = m.get("content", m.get("text", m.get("message", "")))
-            if isinstance(content, list):
-                content = " ".join(str(x) for x in content)
-            content = str(content or "").strip()
-            if content:
-                out.append({"role": role, "content": content})
-    return out[-12:]
 
 
 def _get_or_create_conversation(customer_id, conversation_id=None, session_id=None,
@@ -131,13 +148,11 @@ def _get_or_create_conversation(customer_id, conversation_id=None, session_id=No
 
 
 @eval_bp.get("/health")
-@cross_origin(origins="*")
 def health():
     return {"status": "ok"}
 
 
 @eval_bp.post("/chat")
-@cross_origin(origins="*")
 def chat():
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
@@ -146,15 +161,13 @@ def chat():
     if not text:
         return jsonify(error="Message cannot be empty"), 400
     model = str(payload.get("model") or "auto").strip().lower() or "auto"
-    # Quota guard: this endpoint is unauthenticated, so it must never spend
-    # live-provider quota unless the operator explicitly opts in with
-    # EVAL_ALLOW_LIVE=1 (e.g. an intentional live compare run). Mock answers
-    # carry the same DB grounding; only the phrasing differs. Automated tests
-    # always run with the gate closed, so they need no API key.
-    import os as _os
-    if model != "mock" and _os.getenv("EVAL_ALLOW_LIVE", "").strip() != "1":
+    # Quota guard: evaluation access must never spend live-provider quota
+    # unless the operator explicitly opts in with EVAL_ALLOW_LIVE=1 (e.g. an
+    # intentional live compare run). Mock answers carry the same DB grounding;
+    # only the phrasing differs. Automated tests run with the gate closed.
+    if model != "mock" and os.getenv("EVAL_ALLOW_LIVE", "").strip() != "1":
         model = "mock"
-    history = _extract_history(payload)
+    db_history_rows = []
     try:
         customer_id = _demo_customer_id()
         c = _get_or_create_conversation(
@@ -170,16 +183,12 @@ def chat():
         # directly with the same steps instead.
         from routes.api import _save_msg, _emit
         _save_msg(c.id, customer_id, "CUSTOMER", text, message_type="TEXT")
-        db_history_rows = history
-        if not db_history_rows:
-            from models import Message
-            rows = Message.query.filter_by(conversation_id=c.id).order_by(
-                Message.created_at.asc()).all()
-            db_history_rows = [
-                {"role": "customer" if m.sender_type == "CUSTOMER" else "ai",
-                 "content": m.text} for m in rows]
+        db.session.flush()
+        # Only DB-backed turns are trusted; forged caller history is ignored.
+        db_history_rows = _conversation_history(c.id)
         out = generate_reply(text, customer_id,
-                             conversation_history=db_history_rows, model=model)
+                             conversation_history=db_history_rows, model=model,
+                             allow_writes=_eval_writes_enabled())
         c.intent = out.get("intent")
         c.sentiment = out.get("sentiment")
         c.priority = out.get("priority")
@@ -222,11 +231,14 @@ def chat():
         except Exception:
             pass
         # Never surface 500 to the harness as an empty error: return a
-        # grounded fallback reply with 200 so the case gets judged.
+        # grounded fallback reply with 200 so the case gets judged. Writes are
+        # always disabled on this error path, and caller history is still not
+        # trusted.
         try:
             fallback = generate_reply(
                 text, _demo_customer_id(),
-                conversation_history=history, model="mock")
+                conversation_history=db_history_rows, model="mock",
+                allow_writes=False)
             reply = fallback.get("reply", "")
         except Exception:
             reply = ("I can help with orders, returns, refunds, product "
@@ -236,12 +248,10 @@ def chat():
             "reply": reply, "response": reply, "output": reply,
             "message": reply, "answer": reply, "text": reply,
             "status": "AI_ACTIVE", "model_used": "auto:mock",
-            "warning": f"eval fallback: {type(e).__name__}",
         }), 200
 
 
 @eval_bp.post("/message")
-@cross_origin(origins="*")
 def message_alias():
     return chat()
 
@@ -255,7 +265,6 @@ def _result_to_dict(r):
 
 
 @eval_bp.get("/results")
-@cross_origin(origins="*")
 def results():
     """Stored Chatbot-Compare outcomes, newest first (AIRM-41 Phase 2)."""
     from models import EvaluationResult
@@ -272,7 +281,6 @@ def results():
 
 
 @eval_bp.get("/results/<test_id>")
-@cross_origin(origins="*")
 def results_for_case(test_id):
     """Stored outcomes for one compare case, newest first."""
     from models import EvaluationResult

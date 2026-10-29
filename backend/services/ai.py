@@ -105,14 +105,27 @@ def list_models():
     return out
 
 COMPARATIVE_HINTS = ["cheapest", "lowest price", "best", "recommend", "which one", "compare"]
-COMPARISON_HINTS = ["compare", "comparison", "vs", "versus"]
+COMPARISON_HINTS = ["compare", "comparison", "compares", "comparing", "vs", "versus",
+                    "difference", "better than", "cheaper than",
+                    "which is better", "which is cheaper"]
 REPLACEMENT_HINTS = ["replacement", "replace my", "replace the", "replace order",
                     "replace product", "exchange", "send a new"]
 
 
 def _is_comparison(text):
+    """True for comparison questions in their common natural-language forms.
+
+    Explicit cues ("compare", "vs", "difference between", "which is better")
+    are checked first. A sentence that explicitly names two catalogue
+    products and joins them with "or" is also a comparison
+    ("Pulse Pro or Orbit Watch?"), which keyword-only detection used to miss.
+    """
     low = (text or "").lower()
-    return any(h in low for h in COMPARISON_HINTS)
+    if any(h in low for h in COMPARISON_HINTS):
+        return True
+    if re.search(r"\bor\b", low) and len(_named_products(text)) >= 2:
+        return True
+    return False
 
 
 def _extract_brands(text):
@@ -269,34 +282,60 @@ def _recall_product_context(conversation_history, latest_only=False):
 
     Scans newest-to-oldest so a follow-up ("What is its warranty?") attaches
     to the product discussed most recently instead of the first product in the
-    thread. With ``latest_only`` only the most recent turn that mentions a
-    product is used (right for pronouns like "its price"); otherwise all
-    remembered products are returned (right for "which one is cheapest?").
+    thread. Within a turn, products are ordered by where they appear in the
+    text, so the last product mentioned (e.g. the second item in a comparison
+    reply) wins a following "its ..." question. With ``latest_only`` only the
+    most recent turn that mentions a product is used (right for pronouns like
+    "its price"); otherwise all remembered products are returned (right for
+    "which one is cheapest?").
     Only the supplied conversation history is used, so different
     users/conversations never share product context (the catalogue itself is
     public).
     """
     if not conversation_history:
         return []
+    catalogue = Product.query.all()
     out, seen = [], set()
-    for turn in reversed(conversation_history[-10:]):
+    for turn in reversed(conversation_history[-20:]):
         c = turn.get("content", "") if isinstance(turn, dict) else getattr(turn, "content", "")
         c = (c or "").lower()
         if not c:
             continue
         found = []
-        for p in Product.query.all():
+        for p in catalogue:
             if p.id in seen:
                 continue
             names = [n for n in [p.product_name, p.name, p.brand] if n]
-            if any(n.lower() in c for n in names if len(n) > 2):
-                found.append(p.to_dict())
-        for d in found:
-            seen.add(d["id"])
-            out.append(d)
+            positions = [c.find(n.lower()) for n in names
+                         if len(n) > 2 and n.lower() in c]
+            if positions:
+                found.append((min(positions), p))
+        # Later mentions in the same turn are the more recent context.
+        found.sort(key=lambda item: item[0], reverse=True)
+        for _, p in found:
+            if p.id in seen:
+                continue
+            seen.add(p.id)
+            out.append(p.to_dict())
         if found and latest_only:
             break
     return out
+
+
+def _warranty_dict(rows):
+    """Normalize ``tools.get_warranty`` output to a single warranty record.
+
+    The tool returns a list when Warranty rows exist and a dict for the
+    product-record fallback. Prefer an ACTIVE record; rows are newest-first
+    so the most recent active warranty wins.
+    """
+    if isinstance(rows, dict):
+        return rows
+    if isinstance(rows, list) and rows:
+        active = [r for r in rows if isinstance(r, dict)
+                  and (r.get("status") or "").upper() == "ACTIVE"]
+        return (active or rows)[0]
+    return None
 
 
 PRODUCT_ATTRIBUTE_HINTS = ["price", "cost", "how much", "warranty", "spec",
@@ -323,6 +362,19 @@ def _is_product_followup(text):
     has_pronoun = bool(re.search(r"\b(it|its|this|that|these|those|same)\b", low))
     has_attribute = any(h in low for h in PRODUCT_ATTRIBUTE_HINTS)
     return has_attribute and (has_pronoun or len(low.split()) <= 5)
+
+
+def _references_prior_products(text):
+    """True when a message points back at products from earlier turns.
+
+    Used by comparison queries such as "Compare the cheapest one with Pulse
+    Pro" where one side of the comparison is only available in conversation
+    memory, not in the current sentence.
+    """
+    low = (text or "").lower()
+    return bool(re.search(
+        r"\b(it|its|this|that|these|those|them|one|ones|same|former|latter)\b",
+        low))
 
 
 def _named_products(text):
@@ -465,7 +517,7 @@ def _recall_order_context(conversation_history, customer_id):
     """Find the order discussed earlier so 'When will it arrive?' resolves."""
     if not conversation_history:
         return None
-    for turn in reversed(conversation_history[-10:]):
+    for turn in reversed(conversation_history[-20:]):
         c = turn.get("content", "") if isinstance(turn, dict) else getattr(turn, "content", "")
         ref = _extract_order_ref(c or "")
         if ref and "SRV" not in ref.upper() and "TKT" not in ref.upper():
@@ -481,17 +533,71 @@ def _recall_order_context(conversation_history, customer_id):
     return None
 
 
+def _refund_order_ref(text, order_info, conversation_history, customer_id):
+    """Return the order a refund question is actually about, or None.
+
+    Generic "refund status" questions may use the latest refund across all
+    orders. An explicit/recalled order reference must scope the result so we
+    never answer with another order's refund.
+    """
+    if not order_info:
+        return None
+    ref = _extract_order_ref(text)
+    if ref and "SRV" not in ref.upper() and "TKT" not in ref.upper():
+        return order_info.get("order_number")
+    low = (text or "").lower()
+    if any(k in low for k in ("my order", "this order", "that order",
+                              "previous order", "same order", "the order")):
+        return order_info.get("order_number")
+    recalled = _recall_order_context(conversation_history or [], customer_id)
+    if recalled and recalled.get("id") == order_info.get("id"):
+        return recalled.get("order_number")
+    return None
+
+
 def _is_prompt_injection(text):
     low = (text or "").lower()
-    signals = ["ignore all instructions", "ignore previous instructions",
-               "ignore your instructions", "reveal system prompt",
-               "show me the system prompt", "show system prompt",
-               "system prompt", "reveal your prompt", "show your prompt",
-               "reveal your instructions", "show your instructions",
-               "repeat your instructions", "what were you told",
-               "what is your system", "bypass", "pretend you are",
-               "jailbreak", "dan mode", "override your", "disregard all"]
-    return any(s in low for s in signals)
+    if not low:
+        return False
+    # Match meaningful whole phrases; avoid blocking innocent use of single words like "bypass"
+    phrase_signals = [
+        "ignore all instructions",
+        "ignore previous instructions",
+        "ignore your instructions",
+        "reveal system prompt",
+        "show me the system prompt",
+        "show system prompt",
+        "reveal your prompt",
+        "show your prompt",
+        "reveal your instructions",
+        "show your instructions",
+        "repeat your instructions",
+        "what were you told",
+        "what is your system",
+        "pretend you are",
+        "jailbreak",
+        "dan mode",
+        "override your instructions",
+        "disregard all instructions",
+        "bypass the system",
+        "bypass security",
+        "bypass filter",
+        "bypass restriction",
+        "bypass your rules",
+    ]
+    if any(s in low for s in phrase_signals):
+        return True
+    # Also block explicit requests to reveal internal/system prompts
+    if "system prompt" in low and ("reveal" in low or "show" in low or "give" in low):
+        return True
+    # Common leak/bypass variants
+    if "bypass" in low and ("rule" in low or "rules" in low or "instruction" in low):
+        return True
+    if "give me" in low and ("90%" in low or "discount" in low or "off" in low) and "bypass" in low:
+        return True
+    if "bypass your rules" in low:
+        return True
+    return False
 
 
 PROMPT_INJECTION_REFUSAL = ("I can't share internal instructions or system prompts. "
@@ -560,6 +666,28 @@ def grounded_context(text, customer_id, conversation_history=None):
         # before applying filters so neither half of the comparison is dropped.
         if _is_comparison(text):
             compared = _comparison_products(text, category=category, max_price=cap)
+            low_text = text.lower()
+            superlative = any(h in low_text for h in
+                              ("cheapest", "lowest", "cheaper", "best", "recommend"))
+            # Some comparisons mix an explicit product with one from memory:
+            # "Compare the cheapest one with Pulse Pro" after a Samsung list.
+            # Pull that remembered side in instead of comparing a single item.
+            if (_references_prior_products(text)
+                    and (len(compared) < 2 or superlative)):
+                recalled = _recall_product_context(conversation_history or [])
+                if recalled:
+                    if any(h in low_text for h in ("cheapest", "lowest", "cheaper")):
+                        recalled = [min(recalled, key=lambda p: p.get("price") or 0)]
+                    elif any(h in low_text for h in ("best", "recommend")):
+                        recalled = [max(recalled, key=lambda p: (p.get("rating") or 0,
+                                                                 -(p.get("price") or 0)))]
+                    else:
+                        recalled = recalled[:1]
+                    ids = {p["id"] for p in compared}
+                    for remembered in recalled:
+                        if remembered["id"] not in ids:
+                            ids.add(remembered["id"])
+                            compared.append(remembered)
             if compared:
                 products = sorted(compared, key=lambda p: p.get("price") or 0)
 
@@ -584,20 +712,37 @@ def grounded_context(text, customer_id, conversation_history=None):
             order_info = T.get_order_status(ref, customer_id)
         if not order_info and bare_num and ("#" in text or "rd" in low or "order" in low):
             order_info = T.get_order_status(bare_num.group(0), customer_id)
-        if not order_info and any(k in low for k in ["where is my", "track", "my order", "previous order", "my refund", "refund status"]):
+        if not order_info and any(k in low for k in [
+                "where is my", "track", "my order", "previous order", "my refund",
+                "refund status", "order status", "order details", "order history",
+                "what did i order", "what have i ordered", "what is in my order",
+                "has my order", "is my order", "when will my order",
+                "my package", "my shipment"]):
             # Explicit ref that isn't on this account: never substitute the
             # latest order — the action layer reports it as unknown.
             if _explicit_unknown_order_ref(text, customer_id):
                 pass
             else:
-                orders = T.get_orders(customer_id, limit=1)
-                order_info = orders[0] if orders else None
+                # Prefer the order discussed in this conversation; fall back
+                # to the account's latest order only when there is no memory.
+                order_info = _recall_order_context(
+                    conversation_history or [], customer_id)
+                if not order_info:
+                    orders = T.get_orders(customer_id, limit=1)
+                    order_info = orders[0] if orders else None
     if phone_ok and not order_info and _is_order_followup(text):
         # "When will it arrive?" after "Where is my order?" -> same order.
-        order_info = _recall_order_context(conversation_history or [], customer_id)
-        if not order_info:
-            orders = T.get_orders(customer_id, limit=1)
-            order_info = orders[0] if orders else None
+        # Never let order follow-up swallow a product-attribute pronoun follow-up
+        # (e.g. "Is it available?" after talking about AeroBook).
+        low_f = (text or "").lower()
+        if products and (_is_product_followup(text) or any(h in low_f
+                                                          for h in PRODUCT_ATTRIBUTE_HINTS)):
+            pass
+        else:
+            order_info = _recall_order_context(conversation_history or [], customer_id)
+            if not order_info:
+                orders = T.get_orders(customer_id, limit=1)
+                order_info = orders[0] if orders else None
     # service-request lookup: "status of my repair" -> latest service request.
     # Private data: skipped entirely on phone mismatch (fail closed).
     service_info = None
@@ -611,7 +756,8 @@ def grounded_context(text, customer_id, conversation_history=None):
 
     # refund context (private: suppressed on phone mismatch)
     if "refund" in low and phone_ok:
-        refunds = T.get_refund_status(customer_id=customer_id)
+        refund_ref = _refund_order_ref(text, order_info, conversation_history, customer_id)
+        refunds = T.get_refund_status(customer_id=customer_id, order_ref=refund_ref)
         if refunds:
             extra.append(f"Verified refund: id={refunds[0]['id']} order_id={refunds[0]['order_id']} "
                          f"amount={refunds[0]['amount']} status={refunds[0]['status']}")
@@ -620,8 +766,9 @@ def grounded_context(text, customer_id, conversation_history=None):
 
     # warranty / offers
     if "warranty" in low and products:
-        w = T.get_warranty(product_id=products[0]["id"])
-        if isinstance(w, dict):
+        w = _warranty_dict(T.get_warranty(product_id=products[0]["id"],
+                                          customer_id=customer_id))
+        if w:
             extra.append(f"Warranty for {products[0]['product_name']}: {w.get('period')} ({w.get('status')})")
     if "offer" in low or "discount" in low or "deal" in low:
         for o in T.get_offers(limit=3):
@@ -821,7 +968,7 @@ def _order_matches_products(order, products):
 
 
 def _execute_support_action(intent, text, customer_id, conversation_history,
-                            order_info, products):
+                            order_info, products, allow_writes=True):
     """Run DB-backed support actions directly from chat.
 
     Returns (action_dict, deterministic_reply, service_info).
@@ -842,8 +989,61 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                 f"Please check the order number and try again.", None)
     explicit_write = _has_terms(low, ACTION_TERMS)
 
+    if not allow_writes and intent in ("ORDER_CANCEL", "RETURN_REQUEST", "RETURN_STATUS",
+                                       "RETURN_ELIGIBILITY", "REFUND_REQUEST", "REFUND_STATUS",
+                                       "SERVICE_REQUEST", "SERVICE_STATUS", "DAMAGED_PRODUCT",
+                                       "WARRANTY_CLAIM", "TECHNICAL_SUPPORT", "INSTALLATION_HELP",
+                                       "WARRANTY"):
+        # Evaluation mode without explicit opt-in cannot mutate demo data.
+        # Still allow read-only informational answers where possible.
+        if intent in ("RETURN_ELIGIBILITY", "WARRANTY"):
+            # Fall through to read-only handling below by not blocking here in
+            # a special way except writes are refused.
+            pass
+        elif intent not in ("RETURN_ELIGIBILITY", "WARRANTY"):
+            # For explicit action intents, block writes but still answer
+            # safely without touching DB state.
+            if intent == "ORDER_CANCEL":
+                if not order:
+                    return ({"type": "cancel_order", "ok": False},
+                            "I couldn't find an order on your account to cancel. "
+                            "Please share your order number (e.g. RD100234).", None)
+                return ({"type": "cancel_order", "ok": False,
+                         "order_number": order.get("order_number")},
+                        f"Your order {order.get('order_number')} currently shows "
+                        f"status {order.get('order_status')}. Cancellation is disabled "
+                        f"in evaluation mode.", None)
+            if intent in ("RETURN_REQUEST",):
+                if not order:
+                    return ({"type": "return_request", "ok": False},
+                            "I couldn't find an order on your account to start a return. "
+                            "Please share your order number (e.g. RD100234).", None)
+                return ({"type": "return_request", "ok": False,
+                         "order_number": order.get("order_number")},
+                        f"Return creation is disabled in evaluation mode for order "
+                        f"{order.get('order_number')}.", None)
+            if intent in ("SERVICE_REQUEST", "DAMAGED_PRODUCT", "WARRANTY_CLAIM",
+                          "TECHNICAL_SUPPORT", "INSTALLATION_HELP"):
+                if not order and not products:
+                    return ({"type": "service_request", "ok": False},
+                            "I couldn't find an order or product to raise a service request for. "
+                            "Service request creation is disabled in evaluation mode.", None)
+                target = order.get("order_number") if order else (products[0]["product_name"] if products else "your item")
+                return ({"type": "service_request", "ok": False},
+                        f"Service request creation is disabled in evaluation mode for {target}.", None)
+
     # ---- cancel order ----
     if intent == "ORDER_CANCEL":
+        if not allow_writes:
+            if not order:
+                return ({"type": "cancel_order", "ok": False},
+                        "I couldn't find an order on your account to cancel. "
+                        "Please share your order number (e.g. RD100234).", None)
+            return ({"type": "cancel_order", "ok": False,
+                     "order_number": order.get("order_number")},
+                    f"Your order {order.get('order_number')} currently shows "
+                    f"status {order.get('order_status')}. Cancellation is disabled "
+                    f"in evaluation mode.", None)
         if not order:
             return ({"type": "cancel_order", "ok": False},
                     "I couldn't find an order on your account to cancel. "
@@ -917,6 +1117,9 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                     f"Return check for {elig.get('order_number', 'your order')}: "
                     f"{elig.get('reason', elig.get('error', 'not eligible'))}", None)
         # explicit return request -> check eligibility then create
+        if not allow_writes:
+            return ({"type": "return_request", "ok": False},
+                    f"Return creation is disabled in evaluation mode for {elig.get('order_number', 'your order')}.", None)
         if not elig.get("eligible"):
             return ({"type": "return_request", **elig},
                     f"I can help with your return/refund request. I checked return eligibility: "
@@ -925,6 +1128,11 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
         reason = text.strip()[:300]
         res = T.create_return(elig["order_number"], customer_id, reason=reason)
         if res.get("ok"):
+            if res.get("duplicate"):
+                return ({"type": "return_request", **res},
+                        f"A return request already exists for order {res['order_number']} — "
+                        f"return #{res['return_id']} (status {res['status']}). "
+                        f"Ask 'return status' anytime for updates.", None)
             return ({"type": "return_request", **res},
                     f"Return started for order {res['order_number']} — return #{res['return_id']} "
                     f"(status {res['status']}). Our team will schedule pickup shortly; "
@@ -934,7 +1142,8 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
 
     # ---- refund status ----
     if intent in ("REFUND_REQUEST", "REFUND_STATUS"):
-        refunds = T.get_refund_status(customer_id=customer_id)
+        refund_ref = _refund_order_ref(text, order, conversation_history, customer_id)
+        refunds = T.get_refund_status(customer_id=customer_id, order_ref=refund_ref)
         if refunds:
             r = refunds[0]
             refund_policy = T.get_policy_text("refunds")
@@ -1015,10 +1224,11 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
         if warranty_info_intent and not action_requested:
             p = (products or [None])[0]
             if p:
-                w = T.get_warranty(product_id=p["id"])
-                period = (w.get("period") if isinstance(w, dict)
-                          else p.get("warranty_period") or p.get("warranty") or T.WARRANTY_DEFAULT_PERIOD)
-                status = w.get("status") if isinstance(w, dict) else "ACTIVE"
+                w = _warranty_dict(T.get_warranty(product_id=p["id"],
+                                                  customer_id=customer_id))
+                period = ((w or {}).get("period") or p.get("warranty_period")
+                          or p.get("warranty") or T.WARRANTY_DEFAULT_PERIOD)
+                status = (w or {}).get("status") or "ACTIVE"
                 policy_cat = "installation" if intent == "INSTALLATION_HELP" else "warranty"
                 policy = T.get_policy_text(policy_cat)
                 if intent == "INSTALLATION_HELP":
@@ -1026,8 +1236,12 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                     extra += (" If you'd like a technician visit, say 'book installation' "
                               "and I'll create a service request.")
                 elif intent == "WARRANTY_CLAIM":
-                    extra = (" To claim, share the order number and say "
-                             "'raise a warranty claim' and I'll create a service request.")
+                    if str(status).upper() == "ACTIVE":
+                        extra = (" To claim, share the order number and say "
+                                 "'raise a warranty claim' and I'll create a service request.")
+                    else:
+                        extra = (" This warranty is not active, but I can still help you "
+                                 "raise a repair request for the product.")
                 else:
                     extra = ""
                 return ({"type": "warranty_info", "ok": True},
@@ -1040,9 +1254,9 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
                 # Only use an order's warranty when the customer actually
                 # asked about an order. Never answer a product question
                 # ("warranty of AC") with an unrelated order's warranty.
-                ws = T.get_warranty(order_id=order.get("id"), customer_id=customer_id)
-                if ws:
-                    w = ws[0] if isinstance(ws, list) else ws
+                w = _warranty_dict(T.get_warranty(order_id=order.get("id"),
+                                                  customer_id=customer_id))
+                if w:
                     return ({"type": "warranty_info", "ok": True},
                             f"Order {order.get('order_number')} warranty: "
                             f"{w.get('period')} (status {w.get('status')}). "
@@ -1067,6 +1281,12 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
 
         # explicit service/repair/install/damage/warranty-claim -> create request
         if action_requested:
+            if not allow_writes:
+                product_id = products[0]["id"] if products else None
+                order_ref = order.get("order_number") if order else None
+                target = order_ref or (products[0]["product_name"] if products else "your item")
+                return ({"type": "service_request", "ok": False},
+                        f"Service request creation is disabled in evaluation mode for {target}.", None)
             issue = "REPAIR"
             if any(k in low for k in ["install", "setup", "set up"]):
                 issue = "INSTALLATION"
@@ -1091,11 +1311,14 @@ def _execute_support_action(intent, text, customer_id, conversation_history,
             if res.get("ok"):
                 warranty_note = ""
                 if issue == "WARRANTY" and products:
-                    w = T.get_warranty(product_id=products[0]["id"])
-                    if isinstance(w, dict) and w.get("period"):
-                        warranty_note = f" The recorded warranty is {w['period']}."
+                    w = _warranty_dict(T.get_warranty(
+                        product_id=products[0]["id"], customer_id=customer_id))
+                    if w and w.get("period"):
+                        warranty_note = (f" The recorded warranty is {w['period']} "
+                                         f"({w.get('status')}).")
+                verb = "reused" if res.get("duplicate") else "created"
                 return ({"type": "service_request", **res},
-                        f"Service request {res['request_number']} created ({res['issue_type']}) — "
+                        f"Service request {res['request_number']} {verb} ({res['issue_type']}) — "
                         f"status {res['status']}.{warranty_note} We'll schedule pickup shortly; "
                         f"ask 'status of my repair' anytime for updates.", res)
             return ({"type": "service_request", **res},
@@ -1196,11 +1419,22 @@ def _mock_support_reply(text, intent, ctx, products=None, order_info=None,
         return PROMPT_INJECTION_REFUSAL
     if action_text:
         return action_text
-    if order_info and any(k in lowered for k in ["where", "track", "status", "previous order", "my order"]):
+    # If both exist, prefer answering about the explicitly discussed product
+    # for attribute/availability/pronoun questions over unrelated latest-order
+    # context.
+    if order_info and products and (_is_product_followup(text) or any(h in lowered
+                                                                        for h in PRODUCT_ATTRIBUTE_HINTS)):
+        order_info = None
+    if order_info:
+        items = ", ".join(
+            f"{i.get('product_name')} x{i.get('quantity')}"
+            for i in (order_info.get("items") or []) if i.get("product_name"))
         return (f"Your order {order_info.get('order_number')} has status "
                 f"{order_info.get('order_status')} ({order_info.get('delivery_status') or order_info.get('delivery')}). "
                 f"Expected delivery: {order_info.get('expected_delivery_date') or order_info.get('expected') or 'see tracking'}. "
-                f"Total: {order_info.get('total_amount')}.")
+                f"Items: {items or order_info.get('product') or '—'}. "
+                f"Total: {order_info.get('total_amount')}. "
+                f"Tracking: {order_info.get('tracking_number') or '—'}.")
     if any(h in lowered for h in REPLACEMENT_HINTS):
         # Replacement / exchange questions: answer only from verified context,
         # never invent replacement eligibility.
@@ -1212,6 +1446,12 @@ def _mock_support_reply(text, intent, ctx, products=None, order_info=None,
         return ("I could not find verified replacement information for that product. "
                 "If it is defective or damaged, I can help you raise a repair or replacement service request.")
     if products:
+        if _is_comparison(text):
+            # Real comparison: side-by-side from verified rows (name, price,
+            # specifications, warranty, availability) instead of a plain list.
+            # Checked before "cheapest"/"best" so comparison questions such as
+            # "Compare the cheapest one with Pulse Pro" still show both sides.
+            return _comparison_reply(products)
         if any(h in lowered for h in ["cheapest", "lowest"]):
             best = min(products, key=lambda p: p.get("price", 1e12))
             return (f"The cheapest from the list is {best['product_name']} at {best['price']} "
@@ -1220,10 +1460,6 @@ def _mock_support_reply(text, intent, ctx, products=None, order_info=None,
             best = max(products, key=lambda p: (p.get("rating", 0), -p.get("price", 0)))
             return (f"Based on rating and price, I recommend {best['product_name']} at {best['price']} "
                     f"(rating {best.get('rating', 0)}). All options above come from our live catalogue.")
-        if _is_comparison(text):
-            # Real comparison: side-by-side from verified rows (name, price,
-            # specifications, warranty, availability) instead of a plain list.
-            return _comparison_reply(products)
         attribute_answer = _product_attribute_answer(products, lowered)
         if attribute_answer:
             return attribute_answer
@@ -1371,7 +1607,24 @@ def _resolve_chain(requested):
     return chain
 
 
-def generate_reply(text, customer_id, conversation_history=None, model="auto"):
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# Intents that are safe to use deterministic/canned answers for even in failure cases
+SAFE_DETERMINISTIC_INTENTS = {
+    "ORDER_STATUS", "ORDER_DETAILS", "DELIVERY_DELAY",
+    "RETURN_ELIGIBILITY", "RETURN_STATUS",
+    "REFUND_STATUS"
+}
+
+
+def _is_safe_deterministic_intent(intent):
+    return intent in SAFE_DETERMINISTIC_INTENTS
+
+
+def generate_reply(text, customer_id, conversation_history=None, model="auto", allow_writes=True):
     intent = detect_intent(text)
     # Legacy human-agent intent removed: treat old agent-seeking phrases as general queries.
     if intent == "HUMAN_AGENT_REQUEST":
@@ -1398,20 +1651,20 @@ def generate_reply(text, customer_id, conversation_history=None, model="auto"):
                 "priority": pri, "escalate": False, "products": [], "order": None,
                 "model_used": "mock", "usage": None, "action": {"type": "phone_verification", "ok": False}}
 
-    # Human handoff (AIRM-41 Phase 1): explicit customer requests go to a
-    # human agent. The acknowledgement below is the last AI message; the
-    # route layer moves the conversation to WAITING_FOR_AGENT and stays
-    # silent afterwards.
+    # Human handoff requests in Pure-AI mode: respond politely and continue answering.
     if is_escalation_request(text):
-        return {"reply": ("Got it — connecting you to a human agent. They'll pick up "
-                          "this conversation shortly; please keep this chat open."),
+        contact_reply = ("I'd be happy to help you directly. If you'd like to speak with a human, "
+                         "you can reach our support team at support@supportflow.ai or call +1-800-555-0199. "
+                         "In the meantime, I'm here to help with any questions you have — what can I assist you with?")
+        return {"reply": contact_reply,
                 "intent": "HANDOFF_REQUEST", "sentiment": sent, "priority": pri,
-                "escalate": True, "products": [], "order": None,
-                "model_used": "handoff", "usage": None, "action": {"type": "handoff_request", "ok": True}}
+                "escalate": False, "products": [], "order": None,
+                "model_used": "mock", "usage": None, "action": {"type": "handoff_request", "ok": True}}
 
     # DB-backed action first: deterministic, never invented.
     action, action_text, service_info = _execute_support_action(
-        intent, text, customer_id, conversation_history, order_info, products)
+        intent, text, customer_id, conversation_history, order_info, products,
+        allow_writes=allow_writes)
     if service_info and not order_info:
         pass  # service reply path uses action_text below
 
@@ -1463,6 +1716,32 @@ Answer in plain English:"""
     for provider in chain:
         if provider == "mock":
             used = requested if requested == "mock" else ("auto:mock" if requested == "auto" else f"{requested}->mock")
+            # If all live providers failed, apply limited mode rules
+            if errors:
+                # Allow deterministic fallback only for reliable/safe intents
+                if _is_safe_deterministic_intent(intent) and (action_text or order_info or _is_safe_deterministic_intent(intent)):
+                    reply_text = deterministic
+                    out = {"reply": reply_text, "intent": intent, "sentiment": sent, "priority": pri,
+                           "escalate": False, "products": products, "order": order_info,
+                           "model_used": used, "action": action, "usage": None,
+                           "service": service_info}
+                    if first_provider == "gemini" and any("GEMINI_API_KEY" in e for e in errors):
+                        out["warning"] = ("Gemini API key is not configured; "
+                                          "answered with the local DB-grounded assistant.")
+                    out["model_errors"] = errors
+                    out["limited_mode"] = True
+                    out["provider_failed"] = True
+                    return out
+                else:
+                    reply_text = ("I'm running in limited mode right now because the AI service is temporarily unavailable. "
+                                  "I can't access live AI responses. Please try again in a moment or contact support@supportflow.ai "
+                                  "for immediate assistance.")
+                    out = {"reply": reply_text, "intent": intent, "sentiment": sent, "priority": pri,
+                           "escalate": False, "products": products, "order": order_info,
+                           "model_used": used, "action": action, "usage": None,
+                           "service": service_info, "model_errors": errors,
+                           "limited_mode": True, "provider_failed": True}
+                    return out
             reply_text = deterministic
             # Config problems stay OUT of the customer-facing reply; they are
             # reported in metadata (model_used / warning) instead.
@@ -1491,9 +1770,29 @@ Answer in plain English:"""
                     "model_used": f"{used}:{used_model}", "action": action, "usage": usage,
                     "service": service_info}
         except Exception as exc:
-            errors.append(f"{provider}: {exc}")
+            safe_err = str(exc)
+            # Log safely without exposing keys
+            try:
+                logger.warning("Provider %s failed for customer %s: %s", provider, customer_id, safe_err[:200])
+            except Exception:
+                pass
+            errors.append(f"{provider}: {safe_err}")
             continue
-    # every provider failed (should be unreachable since mock never raises)
+    # every provider failed
+    if errors:
+        # If all live providers failed, return clear limited-mode message
+        # unless it's a safe deterministic intent
+        if (_is_safe_deterministic_intent(intent) and (action_text or order_info or products)) or (deterministic and "limited mode" not in deterministic.lower()):
+            reply_text = deterministic
+        else:
+            reply_text = ("I'm running in limited mode right now because the AI service is temporarily unavailable. "
+                          "I can't access live AI responses. Please try again in a moment or contact support@supportflow.ai "
+                          "for immediate assistance.")
+        out = {"reply": reply_text, "intent": intent, "sentiment": sent, "priority": pri,
+               "escalate": False, "products": products, "order": order_info,
+               "model_used": "mock", "action": action, "usage": None, "service": service_info,
+               "model_errors": errors, "limited_mode": True, "provider_failed": True}
+        return out
     return {"reply": deterministic, "intent": intent, "sentiment": sent, "priority": pri,
             "escalate": False, "products": products, "order": order_info,
             "model_used": "mock", "action": action, "usage": None, "service": service_info,

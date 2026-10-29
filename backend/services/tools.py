@@ -5,16 +5,13 @@ These are the single source of truth used by services/ai.py grounding,
 by the REST API, and (via prompt instructions) by Gemini function calling.
 """
 import re
-from datetime import date, datetime, timedelta
-from models import (
-    db, User, Product, ProductCategory, Order, OrderItem,
-    Payment, ReturnRequest, Refund, Message,
-    Offer, Warranty, Notification, ServiceRequest, KnowledgeBase,
-)
+from datetime import date, datetime, timedelta, timezone
+from models import db, User, Product, ProductCategory, Order, OrderItem, Payment, ReturnRequest, Refund, Message, Offer, Warranty, Notification, ServiceRequest, KnowledgeBase
+
 
 # ------------------------------------------------------------ customers
 def get_customer(customer_id):
-    u = User.query.get(customer_id)
+    u = db.session.get(User, customer_id)
     if not u:
         return None
     return {"id": u.id, "name": u.name, "email": u.email, "phone": u.phone or "",
@@ -28,6 +25,12 @@ WARRANTY_DEFAULT_PERIOD = "1 year"
 
 # Seeded KnowledgeBase policy window, in days ("within 30 days of delivery").
 RETURN_WINDOW_DAYS = 30
+
+# Orders may only be cancelled before the parcel ships. In-transit orders keep
+# their current status and are handled through refusal/return instead.
+CANCELLABLE_ORDER_STATUSES = frozenset({"PLACED", "CONFIRMED", "PROCESSING"})
+IN_TRANSIT_ORDER_STATUSES = frozenset({"SHIPPED", "OUT_FOR_DELIVERY"})
+NON_CANCELLABLE_ORDER_STATUSES = frozenset({"DELIVERED", "CANCELLED", "REFUND_COMPLETED"})
 
 
 def _as_date(value):
@@ -140,11 +143,11 @@ def search_products(query="", brand=None, category=None, max_price=None, min_pri
     return [r[2] for r in results[:limit]]
 
 def get_product(product_id):
-    p = Product.query.get(product_id)
+    p = db.session.get(Product, product_id)
     return p.to_dict() if p else None
 
 def check_stock(product_id):
-    p = Product.query.get(product_id)
+    p = db.session.get(Product, product_id)
     if not p:
         return {"product_id": product_id, "in_stock": False, "stock_quantity": 0}
     return {"product_id": p.id, "product_name": p.display_name,
@@ -170,9 +173,9 @@ def get_warranty(product_id=None, order_id=None, customer_id=None):
         q = q.filter_by(order_id=order_id)
     if customer_id:
         q = q.filter_by(customer_id=customer_id)
-    rows = q.all()
+    rows = q.order_by(Warranty.id.desc()).all()
     if not rows and product_id:
-        p = Product.query.get(product_id)
+        p = db.session.get(Product, product_id)
         if p:
             return {"product_id": product_id, "period": p.warranty_period or p.warranty or WARRANTY_DEFAULT_PERIOD,
                     "status": "ACTIVE", "source": "product record"}
@@ -257,8 +260,31 @@ def cancel_order(order_ref, customer_id):
             pass
     if not o:
         return {"ok": False, "error": "Order not found for this customer."}
-    if (o.order_status or "").upper() in {"DELIVERED", "CANCELLED", "REFUND_COMPLETED"}:
-        return {"ok": False, "error": f"Order {o.order_number} cannot be cancelled (status={o.order_status})."}
+    status = (o.order_status or "").strip().upper()
+    if status in IN_TRANSIT_ORDER_STATUSES:
+        # Once shipped, the parcel cannot be intercepted. Do not touch either
+        # status column; offer the post-delivery options instead.
+        return {
+            "ok": False,
+            "reason": "IN_TRANSIT",
+            "order_number": o.order_number,
+            "order_status": o.order_status,
+            "delivery_status": o.delivery_status,
+            "error": (
+                f"Order {o.order_number} cannot be cancelled because the parcel is "
+                f"already on its way (status={o.order_status}). You can refuse "
+                f"delivery when it arrives, or return the item after arrival within "
+                f"the {RETURN_WINDOW_DAYS}-day return window."
+            ),
+        }
+    if status in NON_CANCELLABLE_ORDER_STATUSES:
+        return {"ok": False, "order_number": o.order_number,
+                "order_status": o.order_status,
+                "error": f"Order {o.order_number} cannot be cancelled (status={o.order_status})."}
+    if status not in CANCELLABLE_ORDER_STATUSES:
+        return {"ok": False, "order_number": o.order_number,
+                "order_status": o.order_status,
+                "error": f"Order {o.order_number} cannot be cancelled (status={o.order_status})."}
     o.order_status = "CANCELLED"
     o.delivery_status = "CANCELLED"
     # A cancelled order will never be delivered — drop the stale estimate
@@ -281,6 +307,16 @@ def create_return(order_ref, customer_id, reason="", product_id=None):
         o = Order.query.filter_by(customer_id=customer_id).order_by(Order.id.desc()).first()
     if not o:
         return {"ok": False, "error": "No order found to return."}
+    # Idempotency: never create a second open return for the same order.
+    # A rejected/cancelled return may be retried, but requested/approved/
+    # picked-up/returned requests are already in progress.
+    existing = (ReturnRequest.query
+                .filter_by(order_id=o.id, customer_id=customer_id)
+                .order_by(ReturnRequest.id.desc()).first())
+    if existing and (existing.status or "").upper() not in {"REJECTED", "CANCELLED"}:
+        return {"ok": True, "duplicate": True, "return_id": existing.id,
+                "order_number": o.order_number, "status": existing.status,
+                "message": f"A return request (#{existing.id}) already exists for order {o.order_number}."}
     r = ReturnRequest(order_id=o.id, customer_id=customer_id, product_id=product_id,
                       reason=reason or "Customer requested return", status="REQUESTED")
     db.session.add(r)
@@ -354,7 +390,7 @@ def get_return_eligibility(order_ref, customer_id):
         return {"ok": True, "eligible": False, "order_number": o["order_number"],
                 "order_status": o.get("order_status"),
                 "reason": f"A return (#{existing.id}, status {existing.status}) already exists for order {o['order_number']}."}
-    row = Order.query.get(o["id"])
+    row = db.session.get(Order, o["id"])
     base = None
     if row is not None:
         base = (_as_date(row.expected_delivery_date) or _as_date(row.order_date)
@@ -397,7 +433,7 @@ def get_product_details(product_ref):
     p = None
     try:
         pid = int(str(product_ref).strip())
-        p = Product.query.get(pid)
+        p = db.session.get(Product, pid)
     except (ValueError, TypeError):
         pass
     if p is None:
@@ -442,7 +478,7 @@ def create_service_request(customer_id, issue_type="REPAIR", description="",
     # customer + issue + target + near-identical description.
     try:
         from datetime import datetime as _dt, timedelta as _td
-        cutoff = _dt.utcnow() - _td(minutes=30)
+        cutoff = _dt.now(timezone.utc).replace(tzinfo=None) - _td(minutes=30)
         open_statuses = ("REQUESTED", "APPROVED", "PICKUP_SCHEDULED", "PICKED_UP",
                          "IN_REPAIR", "REPAIRED", "OUT_FOR_DELIVERY")
         q = ServiceRequest.query.filter(
@@ -493,7 +529,7 @@ def get_service_status(request_ref, customer_id=None):
         return None
     d = row.to_dict()
     if row.product_id:
-        p = Product.query.get(row.product_id)
+        p = db.session.get(Product, row.product_id)
         d["product_name"] = p.display_name if p else ""
     return d
 

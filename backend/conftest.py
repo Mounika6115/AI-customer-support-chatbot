@@ -43,3 +43,10 @@ def _is_isolated(url: str) -> bool:
 if not _is_isolated(os.getenv("DATABASE_URL", "")):
     tmpdir = tempfile.mkdtemp(prefix="supportflow-tests-")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmpdir}/test-support.db"
+
+# Enable eval endpoints for existing tests that rely on them (tests run in
+# non-production, local environment). The shared key is test-only.
+os.environ.setdefault("EVAL_ENABLED", "1")
+os.environ.setdefault("EVAL_KEY", "test-eval-key")
+os.environ.setdefault("EVAL_CORS_ORIGINS", "http://localhost:5173")
+os.environ.setdefault("EVAL_ALLOW_WRITES", "1")

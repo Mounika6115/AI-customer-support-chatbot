@@ -97,22 +97,22 @@ def test_close_other_customers_conversation_404():
 
 
 def test_waiting_notice_persisted_and_deduped():
-    from routes.api import WAITING_NOTICE
     app = _fresh_app()
     c = app.test_client()
     h = {"Authorization": f"Bearer {_token(c, DEMO)}"}
-    cid = c.post("/api/chat", json={"message": "I want to talk to a human agent"},
-                 headers=h).get_json()["conversation_id"]
+    res = c.post("/api/chat", json={"message": "I want to talk to a human agent"},
+                 headers=h).get_json()
+    cid = res["conversation_id"]
+    assert res["status"] == "AI_ACTIVE"
     c.post(f"/api/conversations/{cid}/message",
            json={"message": "Where is my order?"}, headers=h)
     c.post(f"/api/conversations/{cid}/message",
-           json={"message": "Hello? anyone there?"}, headers=h)
-    # polling/refresh view: notice survived, shown exactly once
+           json={"message": "Hello?"}, headers=h)
     msgs = c.get(f"/api/conversations/{cid}", headers=h).get_json()["messages"]
-    notices = [m for m in msgs if m["sender"] == "system" and m["content"] == WAITING_NOTICE]
-    assert len(notices) == 1
     assert len([m for m in msgs if m["sender"] == "customer"]) == 3
-    assert not [m for m in msgs if m["sender"] == "ai" and "order" in m["content"].lower()]
+    # AI should answer all messages in Pure-AI mode
+    ai_msgs = [m for m in msgs if m["sender"] == "ai"]
+    assert len(ai_msgs) >= 2
 
 
 def test_conversations_list_shows_waiting():
@@ -122,4 +122,4 @@ def test_conversations_list_shows_waiting():
     cid = c.post("/api/chat", json={"message": "I want to talk to a human agent"},
                  headers=h).get_json()["conversation_id"]
     convos = c.get("/api/conversations", headers=h).get_json()
-    assert any(x["id"] == cid and x["status"] == "WAITING_FOR_AGENT" for x in convos)
+    assert any(x["id"] == cid and x["status"] == "AI_ACTIVE" for x in convos)

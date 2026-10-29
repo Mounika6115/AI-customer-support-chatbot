@@ -1,3 +1,4 @@
+EVAL_HEADERS = {"X-Eval-Key": "test-eval-key"}
 """AIRM-66: token usage reporting (deterministic, no network)."""
 import services.ai as ai
 from app import create_app
@@ -130,5 +131,5 @@ def test_chat_and_eval_responses_carry_usage(monkeypatch):
     assert "usage" in mock and mock["usage"] is None
     ev = c.post("/api/eval/chat",
                 json={"message": "Show me Samsung phones under 30000",
-                      "model": "mock"}).get_json()
+                      "model": "mock"}, headers=EVAL_HEADERS).get_json()
     assert "usage" in ev and ev["usage"] is None

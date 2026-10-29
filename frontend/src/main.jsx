@@ -3,14 +3,11 @@ import { createRoot } from "react-dom/client";
 import { api } from "./services/api";
 import "./styles.css";
 
-const demo = {
-  customer: ["customer@example.com", "Demo123!"],
-  admin: ["admin@example.com", "Demo123!"],
-};
+const isProductionBuild = import.meta.env.PROD || import.meta.env.VITE_ENV === 'production';
 
 function Login({ setUser }) {
-  const [email, setEmail] = useState(demo.customer[0]);
-  const [password, setPassword] = useState(demo.customer[1]);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   async function go(e) {
     e.preventDefault();
     try {
@@ -28,7 +25,9 @@ function Login({ setUser }) {
         <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" />
         <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
         <button>Sign in</button>
-        <small>Demo: customer@example.com / Demo123! · admin@example.com / Demo123! · agent@example.com / Demo123!</small>
+        {!isProductionBuild && (
+          <small>Demo: customer@example.com / Demo123! · admin@example.com / Demo123! · agent@example.com / Demo123!</small>
+        )}
       </form>
     </div>
   );
@@ -494,9 +493,15 @@ function Customer() {
       if (isNew) {
         // refresh() can't load a brand-new chat yet, so append the reply directly
         if (d.reply) setChat((x) => [...x, { sender: "ai", content: d.reply, model: d.model_used }]);
+        if (d.limited_mode || d.provider_failed) {
+          setChat((x) => [...x, { sender: "system", content: "Limited mode: AI providers are temporarily unavailable. Some features may be restricted." }]);
+        }
       } else {
         // history from the server already contains the new AI reply — don't append it again
         await refresh(true, newCid, g);
+        if (d.limited_mode || d.provider_failed) {
+          setChat((x) => [...x, { sender: "system", content: "Limited mode: AI providers are temporarily unavailable. Some features may be restricted." }]);
+        }
       }
       api("/tickets").then(setTickets).catch(() => {});
     } catch (e) {

@@ -15,7 +15,7 @@ existing routes/tests keep working while the new spec-compliant columns
 (product_name, order_number, message, agent_id, ticket_number, ...) are
 the canonical fields going forward.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
 
@@ -30,8 +30,8 @@ class User(db.Model):
     phone = db.Column(db.String(30), nullable=True)
     password_hash = db.Column(db.String(255), nullable=False, default="")
     role = db.Column(db.String(20), nullable=False, default="customer")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     def set_password(self, p):
         self.password_hash = generate_password_hash(p)
@@ -56,7 +56,7 @@ class Agent(db.Model):
     department = db.Column(db.String(80), nullable=False, default="General")
     status = db.Column(db.String(20), nullable=False, default="OFFLINE")  # ONLINE/OFFLINE/BUSY/AWAY
     availability = db.Column(db.Boolean, nullable=False, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     user = db.relationship("User", foreign_keys=[user_id])
 
@@ -67,7 +67,7 @@ class ProductCategory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(80), unique=True, nullable=False)
     description = db.Column(db.Text, default="")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 # -------------------------------------------------------------- products
@@ -87,8 +87,8 @@ class Product(db.Model):
     warranty_period = db.Column(db.String(100), nullable=True)
     image_url = db.Column(db.String(500), nullable=True)
     specifications = db.Column(db.Text, default="")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     # Legacy columns (kept for backward compatibility)
     name = db.Column(db.String(160), nullable=True)
     category = db.Column(db.String(60), nullable=True, index=True)
@@ -150,8 +150,8 @@ class Order(db.Model):
     delivery_address = db.Column(db.Text, nullable=True)
     expected_delivery_date = db.Column(db.String(20), nullable=True)
     tracking_number = db.Column(db.String(80), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     # Legacy columns
     product = db.Column(db.String(160), nullable=True)
     quantity = db.Column(db.Integer, nullable=True, default=1)
@@ -202,8 +202,8 @@ class Payment(db.Model):
     method = db.Column(db.String(40), nullable=True, default="CARD")
     status = db.Column(db.String(30), nullable=False, default="PENDING")  # PENDING/PAID/FAILED/REFUNDED
     transaction_id = db.Column(db.String(120), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class ReturnRequest(db.Model):
@@ -214,8 +214,8 @@ class ReturnRequest(db.Model):
     product_id = db.Column(db.Integer, db.ForeignKey("products.id"), nullable=True)
     reason = db.Column(db.Text, nullable=False, default="")
     status = db.Column(db.String(30), nullable=False, default="REQUESTED")  # REQUESTED/APPROVED/PICKED_UP/RETURNED/REJECTED
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class Refund(db.Model):
@@ -227,8 +227,8 @@ class Refund(db.Model):
     amount = db.Column(db.Float, nullable=False, default=0.0)
     status = db.Column(db.String(30), nullable=False, default="INITIATED")  # INITIATED/PROCESSING/COMPLETED/FAILED
     reason = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 # ---------------------------------------------------------- conversations
@@ -245,8 +245,8 @@ class Conversation(db.Model):
     ai_summary = db.Column(db.Text, default="")
     assigned_at = db.Column(db.DateTime, nullable=True)
     closed_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     def effective_agent_id(self):
         return self.agent_id or self.assigned_agent_id
@@ -256,7 +256,7 @@ class Conversation(db.Model):
         self.agent_id = agent_user_id
         self.assigned_agent_id = agent_user_id
         if self.assigned_at is None:
-            self.assigned_at = _dt.utcnow()
+            self.assigned_at = _dt.now(timezone.utc).replace(tzinfo=None)
 
 
 class Message(db.Model):
@@ -269,7 +269,7 @@ class Message(db.Model):
     message = db.Column(db.Text, nullable=True)  # spec-canonical field (mirrors content)
     ai_model = db.Column(db.String(60), nullable=True)
     message_type = db.Column(db.String(20), nullable=False, default="TEXT")  # TEXT/PRODUCT/ORDER/SYSTEM/FILE/TICKET
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     @property
     def text(self):
@@ -307,8 +307,8 @@ class Ticket(db.Model):
     status = db.Column(db.String(30), default="OPEN")  # OPEN/WAITING_FOR_AGENT/IN_PROGRESS/RESOLVED/CLOSED
     assigned_agent_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     resolution = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     def ensure_number(self):
         if not self.ticket_number:
@@ -350,7 +350,7 @@ class Offer(db.Model):
     valid_from = db.Column(db.DateTime, nullable=True)
     valid_to = db.Column(db.DateTime, nullable=True)
     active = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class Warranty(db.Model):
@@ -362,7 +362,7 @@ class Warranty(db.Model):
     period = db.Column(db.String(100), nullable=False, default="1 year")
     status = db.Column(db.String(30), nullable=False, default="ACTIVE")
     expires_at = db.Column(db.String(20), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class Notification(db.Model):
@@ -373,7 +373,7 @@ class Notification(db.Model):
     body = db.Column(db.Text, nullable=False, default="")
     kind = db.Column(db.String(40), nullable=False, default="INFO")
     read = db.Column(db.Boolean, nullable=False, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class KnowledgeBase(db.Model):
@@ -390,7 +390,7 @@ class AgentNote(db.Model):
     conversation_id = db.Column(db.Integer, db.ForeignKey("conversations.id"), nullable=False)
     agent_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     content = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class Feedback(db.Model):
@@ -401,7 +401,7 @@ class Feedback(db.Model):
     customer_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     rating = db.Column(db.Integer, nullable=False)
     feedback = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class EvaluationResult(db.Model):
@@ -415,7 +415,17 @@ class EvaluationResult(db.Model):
     passed = db.Column(db.Boolean)
     reason = db.Column(db.Text)
     response_ms = db.Column(db.Integer)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class TokenBlocklist(db.Model):
+    __tablename__ = "token_blocklist"
+    id = db.Column(db.Integer, primary_key=True)
+    jti = db.Column(db.String(36), nullable=False, unique=True, index=True)
+    token_type = db.Column(db.String(10), nullable=False)
+    user_id = db.Column(db.Integer, nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    expires_at = db.Column(db.DateTime, nullable=True)
 
 
 # ------------------------------------------------------- service / repair
@@ -436,8 +446,8 @@ class ServiceRequest(db.Model):
     pickup_status = db.Column(db.String(40), nullable=True, default="NOT_SCHEDULED")
     delivery_status = db.Column(db.String(40), nullable=True, default="NOT_SCHEDULED")
     warranty_claim = db.Column(db.Boolean, nullable=False, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     def ensure_number(self):
         if not self.request_number:

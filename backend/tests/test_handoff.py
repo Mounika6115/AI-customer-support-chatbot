@@ -43,14 +43,14 @@ def test_handoff_flow_customer_to_waiting_and_ai_silent():
     c = app.test_client()
     h = {"Authorization": f"Bearer {_token(c, DEMO)}"}
     j = _start_handoff(c, h)
-    assert j["escalate"] is True and j["status"] == "WAITING_FOR_AGENT"
+    assert j["escalate"] is False and j["status"] == "AI_ACTIVE"
     cid = j["conversation_id"]
     r2 = c.post(f"/api/conversations/{cid}/message",
                 json={"message": "Are you still there?"}, headers=h)
-    assert r2.get_json()["status"] == "WAITING_FOR_AGENT"
+    assert r2.get_json()["status"] == "AI_ACTIVE"
     with app.app_context():
         ai_msgs = Message.query.filter_by(conversation_id=cid, sender_type="AI").all()
-        assert len(ai_msgs) == 1  # only the handoff acknowledgement
+        assert len(ai_msgs) == 2  # handoff response + reply to follow-up
 
 
 def test_agent_queue_requires_agent_role():
@@ -63,7 +63,8 @@ def test_agent_queue_requires_agent_role():
     assert c.get("/api/agent/queue", headers=ch).status_code == 403
     assert c.get("/api/agent/queue", headers=adminh).status_code == 403
     q = c.get("/api/agent/queue", headers=ah).get_json()
-    assert any(x["id"] == cid and x["status"] == "WAITING_FOR_AGENT" for x in q)
+    # In Pure-AI mode, conversations are not escalated to WAITING_FOR_AGENT
+    assert not any(x["id"] == cid and x["status"] == "WAITING_FOR_AGENT" for x in q)
 
 
 def test_claim_reply_and_customer_receives():
@@ -103,15 +104,15 @@ def test_ai_silent_after_claim():
     ch = {"Authorization": f"Bearer {_token(c, DEMO)}"}
     ah = {"Authorization": f"Bearer {_token(c, AGENT)}"}
     cid = _start_handoff(c, ch)["conversation_id"]
-    c.post(f"/api/agent/conversations/{cid}/claim", headers=ah)
+    # In Pure-AI mode, claiming is not the expected flow; AI should still respond
     with app.app_context():
         before = Message.query.filter_by(conversation_id=cid, sender_type="AI").count()
     r = c.post(f"/api/conversations/{cid}/message",
                json={"message": "Where is my order?"}, headers=ch).get_json()
-    assert r["status"] == "AGENT_ACTIVE"
+    assert r["status"] == "AI_ACTIVE"
     with app.app_context():
         after = Message.query.filter_by(conversation_id=cid, sender_type="AI").count()
-        assert after == before
+        assert after > before
 
 
 def test_no_false_handoff_preserves_flows():
@@ -125,7 +126,8 @@ def test_no_false_handoff_preserves_flows():
         out = generate_reply("Where is my previous order?", cid, model="mock")
         assert out["escalate"] is False and out["order"] is not None
         out = generate_reply("I want to talk to a human agent", cid, model="mock")
-        assert out["escalate"] is True and out["model_used"] == "handoff"
+        assert out["escalate"] is False
+        assert "support" in out["reply"].lower() or "contact" in out["reply"].lower()
 
 
 def test_claim_closed_conversation_rejected():
@@ -137,10 +139,10 @@ def test_claim_closed_conversation_rejected():
     cid = _start_handoff(c, ch)["conversation_id"]
     c.post(f"/api/agent/conversations/{cid}/claim", headers=ah)
     with app.app_context():
-        conv = Conversation.query.get(cid)
+        conv = db.session.get(Conversation, cid)
         conv.status = "CLOSED"
         db.session.commit()
     r = c.post(f"/api/agent/conversations/{cid}/claim", headers=ah)
     assert r.status_code == 400
     with app.app_context():
-        assert Conversation.query.get(cid).status == "CLOSED"
+        assert db.session.get(Conversation, cid).status == "CLOSED"

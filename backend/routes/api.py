@@ -1,15 +1,64 @@
-from datetime import datetime
-from flask import Blueprint, request
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from datetime import datetime, timezone
+from flask import Blueprint, request, current_app
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 from models import db, Conversation, Message, Ticket, Order, Feedback
 from services.ai import generate_reply
 from services import tools as T
+import os
 
 api_bp = Blueprint("api", __name__)
 
 
+def _apply_rate_limit(limit_str):
+    try:
+        limiter = getattr(current_app, "limiter", None)
+        if limiter is None:
+            return lambda f: f
+        from flask_limiter.util import get_remote_address
+        return limiter.limit(limit_str, key_func=get_remote_address)
+    except Exception:
+        return lambda f: f
+
+
+
 def cid():
     return int(get_jwt_identity())
+
+
+def _get_user_role():
+    try:
+        claims = get_jwt()
+        if claims:
+            return (claims.get("role") or "").strip().lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_admin():
+    role = _get_user_role()
+    return role == "admin"
+
+
+def _allowed_models_for_customer():
+    # Operator-configured allowlist via env var
+    allowlist = os.getenv("CUSTOMER_ALLOWED_MODELS", "").strip()
+    if allowlist:
+        allowed = [m.strip().lower() for m in allowlist.split(",") if m.strip()]
+        return set(allowed)
+    # Default: only safe models for customers; admins can choose any
+    return {"auto", "mock"}  # Restrictive default - customers cannot pick arbitrary paid models by default
+
+
+def _enforce_model_selection(requested_model, is_admin_user=False):
+    model = (requested_model or "auto").strip().lower()
+    if is_admin_user:
+        return model
+    allowed = _allowed_models_for_customer()
+    if model in allowed:
+        return model
+    # If not allowed, fall back to 'auto' (server-enforced)
+    return "auto"
 
 
 # Waiting-room notice shown (and stored) while a handoff is pending. Kept in
@@ -38,11 +87,12 @@ def _emit(conversation_id, event="new_message"):
 
 @api_bp.post("/chat")
 @jwt_required()
+@_apply_rate_limit("20 per minute")
 def chat():
     d = request.get_json() or {}
     text = (d.get("message") or "").strip()
     conversation_id = d.get("conversation_id")
-    model = (d.get("model") or "auto").strip().lower()
+    model = _enforce_model_selection(d.get("model"), is_admin_user=_is_admin())
     if not text:
         return {"error": "Message cannot be empty"}, 400
     if conversation_id:
@@ -60,17 +110,35 @@ def chat():
 
 @api_bp.post("/conversations/<int:i>/message")
 @jwt_required()
+@_apply_rate_limit("30 per minute")
 def message(i):
     c = Conversation.query.filter_by(id=i, customer_id=cid()).first_or_404()
     d = request.get_json() or {}
-    return handle(c, (d.get("message") or "").strip(), model=(d.get("model") or "auto"))
+    model = _enforce_model_selection(d.get("model"), is_admin_user=_is_admin())
+    return handle(c, (d.get("message") or "").strip(), model=model)
 
 
 @api_bp.get("/models")
 @jwt_required()
 def models():
     from services.ai import list_models
-    return list_models()
+    all_models = list_models()
+    if _is_admin():
+        return all_models
+    allowed = _allowed_models_for_customer()
+    # Filter models for non-admin customers
+    filtered = []
+    for m in all_models:
+        mid = (m.get("id") or "").strip().lower()
+        if mid in allowed:
+            filtered.append(m)
+    # If somehow empty, ensure at least auto/mock are present
+    if not filtered:
+        for m in all_models:
+            mid = (m.get("id") or "").strip().lower()
+            if mid in ("auto", "mock"):
+                filtered.append(m)
+    return filtered
 
 
 def _save_msg(conversation_id, sender_id, sender_type, content, ai_model=None, message_type="TEXT"):
@@ -89,23 +157,26 @@ def handle(c, text, model="auto"):
         # Ended conversations stay ended (AIRM-46): never silently reopen.
         return {"error": "This conversation is closed. Start a new chat to continue."}, 400
     if c.status in ("WAITING_FOR_AGENT", "AGENT_ACTIVE"):
-        # Handoff in progress (AIRM-41 Phase 1): the AI stays silent. The
-        # customer message is stored so the agent can read and reply to it.
-        # The waiting notice is persisted (deduped) so polling/refresh keeps
-        # it visible instead of wiping it.
-        mine = _save_msg(c.id, cid(), "CUSTOMER", text, message_type="TEXT")
-        db.session.flush()
-        prev = (Message.query.filter(Message.conversation_id == c.id,
-                                     Message.id != mine.id)
-                .order_by(Message.created_at.desc(), Message.id.desc()).first())
-        if prev is None or prev.sender_type != "SYSTEM" or prev.text != WAITING_NOTICE:
-            _save_msg(c.id, None, "SYSTEM", WAITING_NOTICE, message_type="SYSTEM")
+        # Pure-AI mode: always continue with AI answers even if previously escalated
+        _save_msg(c.id, cid(), "CUSTOMER", text, message_type="TEXT")
+        history = Message.query.filter_by(conversation_id=c.id).order_by(Message.created_at.asc()).all()
+        history_data = [{"role": "customer" if m.sender_type == "CUSTOMER" else "ai",
+                         "content": m.text} for m in history]
+        out = generate_reply(text, cid(), conversation_history=history_data, model=model)
+        c.intent = out["intent"]
+        c.sentiment = out["sentiment"]
+        c.priority = out["priority"]
+        out["escalate"] = False
+        c.status = "AI_ACTIVE"
+        products = out.get("products") or []
+        order = out.get("order")
+        msg_type = "PRODUCT" if products else ("ORDER" if order else "TEXT")
+        _save_msg(c.id, None, "AI", out["reply"],
+                  ai_model=out.get("model_used") or "mock",
+                  message_type=msg_type)
         db.session.commit()
         _emit(c.id)
-        return {"conversation_id": c.id, "status": c.status, "escalate": True,
-                "reply": WAITING_NOTICE,
-                "model_used": "handoff", "products": [], "order": None,
-                "action": None}
+        return {"conversation_id": c.id, "status": c.status, **out}
     _save_msg(c.id, cid(), "CUSTOMER", text, message_type="TEXT")
     history = Message.query.filter_by(conversation_id=c.id).order_by(Message.created_at.asc()).all()
     history_data = [{"role": "customer" if m.sender_type == "CUSTOMER" else "ai",
@@ -114,11 +185,11 @@ def handle(c, text, model="auto"):
     c.intent = out["intent"]
     c.sentiment = out["sentiment"]
     c.priority = out["priority"]
-    c.status = "WAITING_FOR_AGENT" if out.get("escalate") else "AI_ACTIVE"
+    # Pure-AI mode: never escalate to human agents
+    out["escalate"] = False
+    c.status = "AI_ACTIVE"
     products = out.get("products") or []
     order = out.get("order")
-    # Pure-AI mode: no tickets, no agent assignment. Always answer directly.
-    out["escalate"] = out.get("escalate", False)
     msg_type = "PRODUCT" if products else ("ORDER" if order else "TEXT")
     _save_msg(c.id, None, "AI", out["reply"],
               ai_model=out.get("model_used") or "mock",
@@ -154,7 +225,7 @@ def close_conversation(i):
     c = Conversation.query.filter_by(id=i, customer_id=cid()).first_or_404()
     if c.status != "CLOSED":
         c.status = "CLOSED"
-        c.closed_at = _dt.utcnow()
+        c.closed_at = _dt.now(timezone.utc).replace(tzinfo=None)
         db.session.commit()
     return {"conversation_id": c.id, "status": c.status}
 
@@ -166,16 +237,34 @@ def tickets():
     return [x.to_dict() for x in xs]
 
 
-def _lookup_ticket(ref, customer_id):
+def _lookup_ticket(ref, customer_id, allow_staff=False):
     s = str(ref or "").strip().upper()
+    if allow_staff:
+        t = Ticket.query.filter_by(ticket_number=s).first()
+        if t is None:
+            try:
+                tid = int("".join(ch for ch in s if ch.isdigit()) or s)
+                if tid:
+                    t = Ticket.query.filter_by(id=tid).first()
+            except ValueError:
+                pass
+        if t is None and s.isdigit():
+            try:
+                t = Ticket.query.filter_by(id=int(s)).first()
+            except Exception:
+                pass
+        return t
     t = Ticket.query.filter_by(ticket_number=s, customer_id=customer_id).first()
-    if t is None and s.startswith("TKT"):
-        t = Ticket.query.filter_by(ticket_number=s, customer_id=customer_id).first()
     if t is None:
         try:
             tid = int("".join(ch for ch in s if ch.isdigit()) or s)
             t = Ticket.query.filter_by(id=tid, customer_id=customer_id).first()
         except ValueError:
+            pass
+    if t is None and s.isdigit():
+        try:
+            t = Ticket.query.filter_by(id=int(s), customer_id=customer_id).first()
+        except Exception:
             pass
     return t
 
@@ -220,10 +309,34 @@ def ticket_create():
 @api_bp.patch("/tickets/<ref>")
 @jwt_required()
 def ticket_update(ref):
-    t = _lookup_ticket(ref, cid())
-    if not t:
-        return {"error": "Ticket not found"}, 404
+    role = _get_user_role()
+    is_staff = role in ("agent", "admin")
+    if is_staff:
+        t = _lookup_ticket(ref, cid(), allow_staff=True)
+        if not t:
+            return {"error": "Ticket not found"}, 404
+    else:
+        t = _lookup_ticket(ref, cid(), allow_staff=False)
+        if not t or t.customer_id != cid():
+            return {"error": "Ticket not found"}, 404
     d = request.get_json() or {}
+    if not is_staff:
+        # Customers can only update permitted fields
+        if "status" in d:
+            return {"error": "Forbidden"}, 403
+        if "priority" in d:
+            return {"error": "Forbidden"}, 403
+        if "subject" in d and str(d["subject"]).strip():
+            t.subject = str(d["subject"]).strip()[:200]
+        if "description" in d and str(d["description"]).strip():
+            t.description = str(d["description"]).strip()
+            t.issue = t.description
+        if "category" in d and str(d["category"]).strip():
+            # Allow customers to update category if desired, but not status/priority
+            t.category = str(d["category"]).strip().upper()[:60]
+        db.session.commit()
+        return t.to_dict()
+    # Staff can update more fields
     if "subject" in d and str(d["subject"]).strip():
         t.subject = str(d["subject"]).strip()[:200]
     if "description" in d and str(d["description"]).strip():
@@ -447,11 +560,25 @@ def warranty():
 @jwt_required()
 def feedback():
     d = request.get_json() or {}
-    rating = int(d.get("rating", 0))
-    if rating not in range(1, 6):
+    if d.get("conversation_id") is None:
+        return {"error": "conversation_id is required"}, 400
+    try:
+        conv_id = int(d.get("conversation_id"))
+    except (TypeError, ValueError):
+        return {"error": "conversation_id is required"}, 400
+    c = Conversation.query.filter_by(id=conv_id).first()
+    if not c or c.customer_id != cid():
+        return {"error": "Conversation not found"}, 404
+    rating = d.get("rating")
+    try:
+        rating_int = int(rating)
+    except (TypeError, ValueError):
         return {"error": "Rating must be 1-5"}, 400
-    f = Feedback(conversation_id=d["conversation_id"], customer_id=cid(),
-                 agent_id=d.get("agent_id"), rating=rating, feedback=d.get("feedback"))
+    if rating_int < 1 or rating_int > 5:
+        return {"error": "Rating must be 1-5"}, 400
+    agent_id = c.effective_agent_id() if hasattr(c, "effective_agent_id") else (c.agent_id or getattr(c, "assigned_agent_id", None))
+    f = Feedback(conversation_id=conv_id, customer_id=cid(),
+                 agent_id=agent_id, rating=rating_int, feedback=d.get("feedback"))
     db.session.add(f)
     db.session.commit()
     return {"message": "Thank you"}, 201

@@ -1,3 +1,4 @@
+EVAL_HEADERS = {"X-Eval-Key": "test-eval-key"}
 """AIRM-41 Phase 2: Chatbot-Compare harness regression tests (mock mode)."""
 from app import create_app
 from chatbot_compare import check_case, load_cases, run_compare
@@ -38,10 +39,10 @@ def test_results_endpoints_return_stored():
     run_compare(model="mock", save=True)
     app = create_app()
     c = app.test_client()
-    rows = c.get("/api/eval/results").get_json()
+    rows = c.get("/api/eval/results", headers=EVAL_HEADERS).get_json()
     assert len(rows) >= 5
     assert {"ORDER-001", "ESC-001", "SAFE-001", "GROUND-001", "MULTI-001"} <= {r["test_id"] for r in rows}
-    one = c.get("/api/eval/results/ORDER-001").get_json()
+    one = c.get("/api/eval/results/ORDER-001", headers=EVAL_HEADERS).get_json()
     assert len(one) >= 1 and all(r["test_id"] == "ORDER-001" for r in one)
     assert all("passed" in r and "actual" in r for r in rows)
 
@@ -76,10 +77,10 @@ def test_eval_fresh_isolates_threads():
     _reset_db()
     app = create_app()
     c = app.test_client()
-    a = c.post("/api/eval/chat", json={"message": "Hi"}).get_json()["conversation_id"]
-    b = c.post("/api/eval/chat", json={"message": "Hi"}).get_json()["conversation_id"]
+    a = c.post("/api/eval/chat", json={"message": "Hi"}, headers=EVAL_HEADERS).get_json()["conversation_id"]
+    b = c.post("/api/eval/chat", json={"message": "Hi"}, headers=EVAL_HEADERS).get_json()["conversation_id"]
     assert a == b  # default reuse keeps multi-turn memory
-    n = c.post("/api/eval/chat", json={"message": "Hi", "fresh": True}).get_json()["conversation_id"]
+    n = c.post("/api/eval/chat", json={"message": "Hi", "fresh": True}, headers=EVAL_HEADERS).get_json()["conversation_id"]
     assert n not in (a, b)
 
 
@@ -98,7 +99,7 @@ def test_eval_forces_mock_without_opt_in(monkeypatch):
     c = app.test_client()
     for model in ("gemini", "auto", "claude"):
         j = c.post("/api/eval/chat",
-                   json={"message": "Show me Samsung phones under 30000", "model": model}).get_json()
+                   json={"message": "Show me Samsung phones under 30000", "model": model}, headers=EVAL_HEADERS).get_json()
         assert "mock" in j["model_used"], model
         assert "Galaxy" in j["reply"]
 
@@ -111,6 +112,6 @@ def test_eval_live_opt_in_preserved(monkeypatch):
     app = create_app()
     c = app.test_client()
     j = c.post("/api/eval/chat",
-               json={"message": "Show me Samsung phones under 30000", "model": "gemini"}).get_json()
+               json={"message": "Show me Samsung phones under 30000", "model": "gemini"}, headers=EVAL_HEADERS).get_json()
     assert j["model_used"] == "gemini:test-model"
     assert j["reply"] == "Canned live."
